@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+# Cancel in-progress runs when a new push arrives on the same branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_USER: brewsync_owner
+          POSTGRES_PASSWORD: brewsync_owner
+          POSTGRES_DB: brewsync_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgresql://brewsync_app:brewsync_app@localhost:5432/brewsync_test?schema=public
+      DIRECT_DATABASE_URL: postgresql://brewsync_owner:brewsync_owner@localhost:5432/brewsync_test?schema=public
+      TEST_DATABASE_URL: postgresql://brewsync_app:brewsync_app@localhost:5432/brewsync_test?schema=public
+      TEST_DIRECT_DATABASE_URL: postgresql://brewsync_owner:brewsync_owner@localhost:5432/brewsync_test?schema=public
+      JWT_ACCESS_SECRET: ci-test-access-secret-not-for-production
+      JWT_REFRESH_SECRET: ci-test-refresh-secret-not-for-production
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_TTL: 30d
+      PORT: 4000
+      LOG_LEVEL: warn
+      CORS_ORIGINS: http://localhost:5173
+      OUTBOX_POLL_INTERVAL_MS: 2000
+      OUTBOX_BATCH_SIZE: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Create app role in Postgres
+        run: |
+          PGPASSWORD=brewsync_owner psql -h localhost -U brewsync_owner -d brewsync_test -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'brewsync_app') THEN
+                CREATE ROLE brewsync_app LOGIN PASSWORD 'brewsync_app' NOBYPASSRLS;
+              END IF;
+            END \$\$;
+          "
+
+      - name: Apply migrations
+        run: pnpm --filter @brewsync/db exec prisma migrate deploy
+
+      - name: Seed permission catalog
+        run: |
+          cat > /tmp/seed-permissions-ci.ts << 'EOF'
+          import { PrismaClient } from '@brewsync/db'
+          import { seedPermissionCatalog } from '@brewsync/db'
+
+          const prisma = new PrismaClient({
+            datasourceUrl: process.env.DIRECT_DATABASE_URL,
+          })
+
+          seedPermissionCatalog(prisma)
+            .then((count) => {
+              console.log(`Seeded ${count} permissions`)
+              return prisma.$disconnect()
+            })
+            .catch((error) => {
+              console.error('Seed failed:', error)
+              process.exitCode = 1
+              return prisma.$disconnect()
+            })
+          EOF
+          pnpm exec tsx /tmp/seed-permissions-ci.ts
+
+      - name: Grant privileges to app role
+        run: |
+          PGPASSWORD=brewsync_owner psql -h localhost -U brewsync_owner -d brewsync_test <<EOF
+            GRANT CONNECT ON DATABASE brewsync_test TO brewsync_app;
+            GRANT USAGE ON SCHEMA public TO brewsync_app;
+            GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO brewsync_app;
+            GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO brewsync_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO brewsync_app;
+            ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO brewsync_app;
+          EOF
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Build
+        run: pnpm run build

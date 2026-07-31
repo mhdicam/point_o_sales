@@ -1,0 +1,8 @@
+export * from './context.js'
+export * from './client.js'
+export * from './tenant-scope.js'
+export * from './rls.js'
+export * from './outbox.js'
+export * from './seed-permissions.js'
+export { Prisma, PrismaClient } from '../generated/client/index.js'
+export type * from '../generated/client/index.js'

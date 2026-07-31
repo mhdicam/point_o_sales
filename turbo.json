@@ -1,0 +1,56 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "ui": "stream",
+  "globalDependencies": [".env"],
+  "globalEnv": [
+    "NODE_ENV",
+    "DATABASE_URL",
+    "DIRECT_DATABASE_URL",
+    "TEST_DATABASE_URL",
+    "TEST_DIRECT_DATABASE_URL",
+    "JWT_ACCESS_SECRET",
+    "JWT_REFRESH_SECRET",
+    "JWT_ACCESS_TTL",
+    "JWT_REFRESH_TTL",
+    "PORT",
+    "LOG_LEVEL",
+    "CORS_ORIGINS",
+    "OUTBOX_POLL_INTERVAL_MS",
+    "OUTBOX_BATCH_SIZE",
+    "PLATFORM_API_TOKEN"
+  ],
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["dist/**", "build/**", ".prisma/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true,
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "lint": {
+      "outputs": []
+    },
+    "test": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test:unit": {
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "test:integration": {
+      "cache": false,
+      "dependsOn": ["^build"],
+      "outputs": []
+    },
+    "generate": {
+      "cache": false
+    }
+  }
+}

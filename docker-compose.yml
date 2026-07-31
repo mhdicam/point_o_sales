@@ -1,0 +1,25 @@
+# S0-03 — local Postgres. `pnpm db:up`
+#
+# Note: if you already run Postgres locally (Homebrew), you can skip this and
+# point DATABASE_URL at that instance instead; see CONTRIBUTING.md.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: brewsync-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: brewsync
+      POSTGRES_PASSWORD: brewsync
+      POSTGRES_DB: brewsync_dev
+    ports:
+      - '5433:5432'
+    volumes:
+      - brewsync-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U brewsync -d brewsync_dev']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  brewsync-pgdata:

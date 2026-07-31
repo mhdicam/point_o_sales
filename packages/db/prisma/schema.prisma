@@ -1,0 +1,638 @@
+// brewsync 2.0 — Prisma schema
+//
+// Scope: S1 (Tenant/Outlet, User, Outbox) + S2 (RBAC, TenantMembership,
+// BusinessProfile). Product master, orders, inventory arrive in S3+.
+//
+// Conventions:
+//   - Every tenant-owned model carries `tenantId`. The Prisma Client Extension
+//     in src/tenant-scope.ts injects the filter; Postgres RLS backs it up.
+//     Never write `where: { tenantId }` in a service (standard #1).
+//   - Money is BigInt minor units (standard #2). No Float/Decimal for money.
+//   - Ledger tables are append-only (standard #3): no balance column anywhere.
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Tenancy & configuration — S1-01, S2-07
+// ---------------------------------------------------------------------------
+
+model Tenant {
+  id        String       @id @default(uuid()) @db.Uuid
+  slug      String       @unique
+  name      String
+  status    TenantStatus @default(ACTIVE)
+  timezone  String       @default("Asia/Jakarta")
+  currency  String       @default("IDR")
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  outlets         Outlet[]
+  businessProfile BusinessProfile?
+  memberships     TenantMembership[]
+  roles           Role[]
+  userRoles       UserRole[]
+  outboxEvents    OutboxEvent[]
+
+  // Master product — S3
+  units                 Unit[]
+  categories            Category[]
+  products              Product[]
+  productVariants       ProductVariant[]
+  modifierGroups        ModifierGroup[]
+  modifiers             Modifier[]
+  productModifierGroups ProductModifierGroup[]
+  priceLists            PriceList[]
+  priceListItems        PriceListItem[]
+
+  @@map("tenants")
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+model Outlet {
+  id       String       @id @default(uuid()) @db.Uuid
+  tenantId String       @db.Uuid
+  code     String
+  name     String
+  address  String?
+  phone    String?
+  status   OutletStatus @default(ACTIVE)
+
+  // Design §6.3 / §4.2 — per-outlet fiscal + inventory behaviour. Configuration,
+  // not code branches. Rates are basis points (1000 = 10%) so no float appears.
+  taxInclusive       Boolean            @default(false)
+  taxRateBp          Int                @default(1100)
+  serviceChargeRateBp Int               @default(0)
+  roundingIncrement  Int                @default(100)
+  stockDeductionPoint StockDeductionPoint @default(PAID)
+  cashVarianceToleranceMinor BigInt      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userRoles    UserRole[]
+  outboxEvents OutboxEvent[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("outlets")
+}
+
+enum OutletStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// Design §4.2 — whether stock leaves on SENT (kitchen starts) or PAID (retail).
+enum StockDeductionPoint {
+  SENT
+  PAID
+}
+
+/// Design §2.2 — preset + per-feature override. The toggle set that makes one
+/// core behave as F&B, Retail, or Service. `features` is JSON validated against
+/// FeatureFlags in @brewsync/shared on read and write.
+model BusinessProfile {
+  id        String          @id @default(uuid()) @db.Uuid
+  tenantId  String          @unique @db.Uuid
+  preset    BusinessPreset
+  features  Json
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("business_profiles")
+}
+
+enum BusinessPreset {
+  FNB
+  RETAIL
+  SERVICE
+  MIXED
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access — S1-05, S2-01..S2-06 (design §12, §13)
+// ---------------------------------------------------------------------------
+
+/// Global login identity. Deliberately NOT tenant-scoped: one person can belong
+/// to several tenants (design §13). Tenant-specific data lives on
+/// TenantMembership.
+model User {
+  id           String     @id @default(uuid()) @db.Uuid
+  email        String     @unique
+  passwordHash String?
+  fullName     String
+  phone        String?
+  avatarUrl    String?
+  status       UserStatus @default(INVITED)
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  memberships   TenantMembership[]
+  userRoles     UserRole[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+/// Design §13.1 — a user's membership in one tenant. The cashier PIN lives here,
+/// not on User: PINs are per-tenant and only meaningful on a shared POS device.
+model TenantMembership {
+  id           String           @id @default(uuid()) @db.Uuid
+  tenantId     String           @db.Uuid
+  userId       String           @db.Uuid
+  displayName  String?
+  pinHash      String?
+  employeeCode String?
+  status       MembershipStatus @default(ACTIVE)
+  joinedAt     DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  // A cashier PIN is 4–8 digits, so the keyspace is small enough to brute
+  // force. Counting failures per membership and locking out makes that
+  // impractical without punishing an honest cashier's typo (S2-06).
+  pinFailedAttempts Int       @default(0)
+  pinLockedUntil    DateTime?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId])
+  @@unique([tenantId, employeeCode])
+  @@index([tenantId])
+  @@map("tenant_memberships")
+}
+
+enum MembershipStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// Design §12.2 — system-defined catalog, no tenantId. The backend checks exact
+/// keys, so tenants compose these into roles but never invent new ones.
+model Permission {
+  key         String @id
+  domain      String
+  description String
+
+  rolePermissions RolePermission[]
+
+  @@index([domain])
+  @@map("permissions")
+}
+
+model Role {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String   @db.Uuid
+  name      String
+  isSystem  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  createdBy String?  @db.Uuid
+  updatedAt DateTime @updatedAt
+
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  permissions RolePermission[]
+  userRoles   UserRole[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("roles")
+}
+
+model RolePermission {
+  roleId        String @db.Uuid
+  permissionKey String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionKey], references: [key], onDelete: Cascade)
+
+  @@id([roleId, permissionKey])
+  @@index([permissionKey])
+  @@map("role_permissions")
+}
+
+/// Design §12.2 — role assignment scoped per outlet. A null outletId means
+/// tenant-wide (owner). The same person can be Manager at outlet A and Cashier
+/// at outlet B.
+model UserRole {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @db.Uuid
+  userId   String  @db.Uuid
+  roleId   String  @db.Uuid
+  outletId String? @db.Uuid
+
+  createdAt DateTime @default(now())
+  createdBy String?  @db.Uuid
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role    @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  outlet Outlet? @relation(fields: [outletId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, userId, roleId, outletId])
+  @@index([tenantId, userId])
+  @@map("user_roles")
+}
+
+/// Refresh token rotation (S1-05). Stored hashed; `revokedAt` set on rotation so
+/// a stolen token cannot be replayed after use.
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  userAgent String?
+  ip        String?
+
+  /// Chains every token descended from one login. Rotation revokes the row it
+  /// consumed; if a consumed token is presented again the value has leaked, so
+  /// the whole family is revoked rather than just that call (S1-05).
+  familyId String @default(uuid()) @db.Uuid
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Integration — S1-06 (design §8)
+// ---------------------------------------------------------------------------
+
+/// Transactional outbox. Written in the SAME transaction as the business change
+/// (standard #4); a worker dispatches later. Payload is a self-contained
+/// snapshot so consumers never query back into POS (design §8.2).
+model OutboxEvent {
+  id           String    @id @default(uuid()) @db.Uuid
+  tenantId     String    @db.Uuid
+  outletId     String?   @db.Uuid
+  type         String
+  payload      Json
+  occurredAt   DateTime  @default(now())
+  dispatchedAt DateTime?
+  attempts     Int       @default(0)
+  lastError    String?
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet Outlet? @relation(fields: [outletId], references: [id], onDelete: SetNull)
+
+  // Partial index on undispatched rows keeps the worker's poll cheap as the
+  // table grows, and makes "stuck event" monitoring (sprint plan §17.3) fast.
+  @@index([dispatchedAt, occurredAt])
+  @@index([tenantId])
+  @@map("outbox_events")
+}
+
+/// Consumer-side idempotency ledger (design §8.2). A consumer records the event
+/// id it processed; a retried dispatch is then a no-op rather than a double
+/// journal entry.
+model ProcessedEvent {
+  eventId     String   @db.Uuid
+  consumer    String
+  processedAt DateTime @default(now())
+
+  @@id([eventId, consumer])
+  @@map("processed_events")
+}
+
+// ---------------------------------------------------------------------------
+// Master product — S3-01..S3-05 (design §3)
+//
+// The organising principle from design §3: separate identity from price from
+// composition. Product is the concept, ProductVariant is the sellable SKU that
+// owns price/barcode/recipe, PriceList overrides price per context, and
+// ModifierGroup carries order-time options.
+// ---------------------------------------------------------------------------
+
+/// Design §3.2 — units in two roles that get confused and wreck stock: sell unit
+/// ("cup", "pcs") vs stock/recipe unit ("gram", "ml").
+///
+/// Conversion is expressed against a base unit within one dimension: `factor` is
+/// how many base units one of this unit equals, scaled by UNIT_FACTOR_SCALE so no
+/// float appears (1 kg = 1000 g → factor 1000 * scale). A unit with
+/// `baseUnitId = null` IS the base of its dimension and must have factor = scale.
+model Unit {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String  @db.Uuid
+  code       String
+  name       String
+  dimension  UnitDimension
+  /// Null = this unit is the base of its dimension.
+  baseUnitId String? @db.Uuid
+  /// Scaled integer (see UNIT_FACTOR_SCALE in @brewsync/shared). Never a float:
+  /// 1 tsp = 4.929 ml would otherwise drift once multiplied through a recipe.
+  factor     BigInt  @default(1000000)
+  isActive   Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant       Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  baseUnit     Unit?            @relation("UnitBase", fields: [baseUnitId], references: [id], onDelete: Restrict)
+  derivedUnits Unit[]           @relation("UnitBase")
+  sellVariants ProductVariant[] @relation("VariantSellUnit")
+  stockVariants ProductVariant[] @relation("VariantStockUnit")
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@index([baseUnitId])
+  @@map("units")
+}
+
+/// Dimensions a unit can measure. Conversion is only legal within one dimension
+/// — grams to millilitres needs a density, which is a per-ingredient fact and
+/// deliberately out of scope here (design §3.2).
+enum UnitDimension {
+  COUNT
+  WEIGHT
+  VOLUME
+  LENGTH
+  TIME
+}
+
+/// Design §3.1 — nested via self-reference. Not merely menu tidiness: a category
+/// carries *defaults* that flow down to its products (KDS station route, tax
+/// rate, report grouping). Set once, inherited by everything beneath.
+model Category {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @db.Uuid
+  parentId String? @db.Uuid
+  name     String
+  /// Stable slug for report grouping — survives a rename, unlike `name`.
+  slug     String
+  sortOrder Int    @default(0)
+  isActive Boolean @default(true)
+
+  /// Defaults inherited by products in this category. Null = inherit from the
+  /// parent category, then fall back to the outlet setting. Resolved in one
+  /// place (category.service) so the precedence rule cannot drift.
+  defaultTaxRateBp Int?
+  /// KDS routing hint. Station lands in S7; kept as a plain uuid until then so
+  /// this column does not need a second migration.
+  defaultStationId String? @db.Uuid
+  reportGroup      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@index([parentId])
+  @@map("categories")
+}
+
+/// Design §3.1 — the concept a customer sees ("Kopi Susu", "Cukur Rambut"). Not
+/// necessarily sellable on its own: it is a container for variants.
+/// `fulfillmentType` sits here as the default and may be overridden per variant.
+model Product {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String  @db.Uuid
+  categoryId String? @db.Uuid
+  name       String
+  /// Tenant-unique handle used by imports and the public catalog URL.
+  slug        String
+  description String?
+  imageUrl    String?
+
+  /// Design §2.1 — the single data point that decides whether an item needs
+  /// stock, a recipe, KDS routing, or a time slot. Never branch on a vertical
+  /// name; read this instead.
+  fulfillmentType FulfillmentType @default(STOCKED)
+
+  isActive Boolean @default(true)
+  sortOrder Int    @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant         Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  category       Category?              @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  variants       ProductVariant[]
+  modifierGroups ProductModifierGroup[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@index([categoryId])
+  @@map("products")
+}
+
+/// Design §2.1 — STOCKED needs stock, MADE_TO_ORDER needs a recipe + KDS route,
+/// SERVICE needs a time slot and assigned staff. This enum is what makes the
+/// single core change shape without branching on vertical.
+enum FulfillmentType {
+  STOCKED
+  MADE_TO_ORDER
+  SERVICE
+}
+
+/// Design §3.1 — the real SKU. Price, barcode, and (from S6) recipe live HERE,
+/// not on Product. A product with no meaningful variation still gets exactly one
+/// default variant so nothing downstream needs a special case.
+model ProductVariant {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  productId String @db.Uuid
+
+  sku     String
+  name    String
+  barcode String?
+
+  /// Fallback price in minor units (standard #2). PriceList overrides this per
+  /// outlet/sales-method context; see design §3.3.
+  basePrice BigInt @default(0)
+
+  /// Overrides Product.fulfillmentType when set — a product may mix, e.g. a
+  /// brewed drink (MADE_TO_ORDER) and a bagged-bean variant (STOCKED).
+  fulfillmentType FulfillmentType?
+
+  /// Design §3.2 — the unit this variant is *sold* in, and the unit it is
+  /// *stocked/consumed* in. Both optional: a SERVICE variant has neither.
+  sellUnitId  String? @db.Uuid
+  stockUnitId String? @db.Uuid
+
+  /// For SERVICE variants (design §2.1) — how long one booking occupies a slot.
+  serviceDurationMin Int?
+
+  isDefault Boolean @default(false)
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant     Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product    Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sellUnit   Unit?           @relation("VariantSellUnit", fields: [sellUnitId], references: [id], onDelete: Restrict)
+  stockUnit  Unit?           @relation("VariantStockUnit", fields: [stockUnitId], references: [id], onDelete: Restrict)
+  priceItems PriceListItem[]
+
+  @@unique([tenantId, sku])
+  // Barcode lookup is the retail scan path — must be unique per tenant to be
+  // usable as a lookup key at all (features.barcode).
+  @@unique([tenantId, barcode])
+  @@index([tenantId])
+  @@index([productId])
+  @@map("product_variants")
+}
+
+/// Design §3.1 — order-time options, NOT separate SKUs. A group is the question
+/// ("Sugar level"), a Modifier is an answer ("Less sugar").
+/// Gated by `features.modifiers`.
+model ModifierGroup {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @db.Uuid
+  name     String
+
+  /// Selection rules, validated when an order item is built (S4).
+  minSelect Int     @default(0)
+  maxSelect Int?
+  isRequired Boolean @default(false)
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  modifiers Modifier[]
+  products  ProductModifierGroup[]
+
+  @@index([tenantId])
+  @@map("modifier_groups")
+}
+
+/// Design §3.1 — one option. `priceDelta` adjusts price (may be negative);
+/// `recipeDelta` (S6) adjusts ingredient consumption, which is how "Less Sugar"
+/// costs the same but consumes less.
+model Modifier {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  groupId  String @db.Uuid
+  name     String
+
+  /// Signed minor units (standard #2) — negative is a legitimate discount-style
+  /// option, so this is deliberately not unsigned.
+  priceDelta BigInt @default(0)
+
+  isDefault Boolean @default(false)
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  group  ModifierGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([groupId])
+  @@map("modifiers")
+}
+
+/// Explicit join for Product ↔ ModifierGroup (design §3.1 "boleh pakai").
+/// Explicit rather than implicit m2m so it can carry `sortOrder` and, later,
+/// per-product overrides of the group's selection rules.
+model ProductModifierGroup {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  productId String @db.Uuid
+  groupId   String @db.Uuid
+  sortOrder Int    @default(0)
+
+  tenant  Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product Product       @relation(fields: [productId], references: [id], onDelete: Cascade)
+  group   ModifierGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, groupId])
+  @@index([tenantId])
+  @@index([groupId])
+  @@map("product_modifier_groups")
+}
+
+/// Design §3.3 — price per context. A list may target one outlet, one sales
+/// method, both, or neither (tenant-wide). Resolution order and the basePrice
+/// fallback live in price.service so there is one implementation.
+///
+/// `salesMethod` is a plain string until SalesMethod arrives in S7; the resolver
+/// compares it case-sensitively against Order.salesMethod.
+model PriceList {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @db.Uuid
+  name     String
+  /// Null = applies to every outlet.
+  outletId String? @db.Uuid
+  /// Null = applies to every sales method.
+  salesMethod String?
+
+  /// Higher wins when two lists match the same context. Explicit so the
+  /// tie-break is data, not row order.
+  priority Int @default(0)
+
+  validFrom DateTime?
+  validTo   DateTime?
+  isActive  Boolean   @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  items  PriceListItem[]
+
+  @@index([tenantId])
+  @@index([outletId])
+  @@map("price_lists")
+}
+
+/// One variant's price inside a list. Absence means "no override" — the resolver
+/// falls back to ProductVariant.basePrice (design §3.3).
+model PriceListItem {
+  id          String @id @default(uuid()) @db.Uuid
+  tenantId    String @db.Uuid
+  priceListId String @db.Uuid
+  variantId   String @db.Uuid
+  /// Minor units (standard #2).
+  price       BigInt
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  priceList PriceList      @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@unique([priceListId, variantId])
+  @@index([tenantId])
+  @@index([variantId])
+  @@map("price_list_items")
+}
