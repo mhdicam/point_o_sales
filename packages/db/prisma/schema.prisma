@@ -54,6 +54,11 @@ model Tenant {
   priceLists            PriceList[]
   priceListItems        PriceListItem[]
 
+  // Order — S4
+  orders       Order[]
+  orderItems   OrderItem[]
+  orderCharges OrderCharge[]
+
   @@map("tenants")
 }
 
@@ -86,6 +91,7 @@ model Outlet {
   tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   userRoles    UserRole[]
   outboxEvents OutboxEvent[]
+  orders       Order[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -549,6 +555,7 @@ model ProductVariant {
   sellUnit   Unit?           @relation("VariantSellUnit", fields: [sellUnitId], references: [id], onDelete: Restrict)
   stockUnit  Unit?           @relation("VariantStockUnit", fields: [stockUnitId], references: [id], onDelete: Restrict)
   priceItems PriceListItem[]
+  orderItems OrderItem[]
 
   @@unique([tenantId, sku])
   // Barcode lookup is the retail scan path — must be unique per tenant to be
@@ -689,4 +696,141 @@ model PriceListItem {
   @@index([tenantId])
   @@index([variantId])
   @@map("price_list_items")
+}
+
+// ── Order — S4 ──────────────────────────────────────────────────────────────
+
+/// Design §6 — the order lifecycle. Transitions are validated in one place
+/// (order.state.ts, standard #6); an illegal transition throws. `channel` is
+/// origin metadata only — QR and online orders run the same machine, pipeline,
+/// and events as staff orders (they do not fork the flow).
+enum OrderStatus {
+  OPEN
+  SENT
+  SERVED
+  BILLED
+  PAID
+  CLOSED
+  VOID
+}
+
+enum OrderChannel {
+  STAFF
+  QR_TABLE
+  ONLINE
+}
+
+/// Design §6.2 — each non-item component of the bill is one row, so receipts and
+/// tax reports aggregate rows instead of recomputing. `amount` is signed minor
+/// units (discounts negative). Ordering is fixed (§6): discount → service charge
+/// → tax → rounding → gratuity; `sortOrder` freezes that sequence as data.
+enum OrderChargeKind {
+  DISCOUNT
+  SERVICE_CHARGE
+  TAX
+  ROUNDING
+  GRATUITY
+}
+
+/// Design §6/§7 — "what was ordered". Bill (BILLED) and Payment (PAID) are
+/// separate levels arriving in S5; this model stops at the BILLED snapshot.
+model Order {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  outletId String @db.Uuid
+
+  status  OrderStatus  @default(OPEN)
+  channel OrderChannel @default(STAFF)
+
+  /// Plain string until SalesMethod arrives in S7; matches the PriceList seam
+  /// (price.service compares it case-sensitively).
+  salesMethod String?
+
+  /// Standard #7 — item snapshots freeze at SENT; charges freeze at BILLED.
+  sentAt   DateTime?
+  billedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet  Outlet        @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  items   OrderItem[]
+  charges OrderCharge[]
+
+  @@index([tenantId])
+  @@index([outletId])
+  @@map("orders")
+}
+
+/// One line on the order. Standard #7 — `*Snapshot` columns freeze the price,
+/// name, and chosen modifiers at SENT so editing master data afterwards never
+/// shifts a historical line. They stay zero/empty/null until then.
+model OrderItem {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  orderId   String @db.Uuid
+  variantId String @db.Uuid
+
+  qty Int
+
+  /// Frozen at SENT via PriceService.resolveMany (standard #7). Minor units.
+  priceSnapshot BigInt @default(0)
+  nameSnapshot  String @default("")
+
+  /// Sum of chosen modifier price deltas, frozen at SENT. Minor units.
+  modifierDeltaSnapshot BigInt @default(0)
+  /// Frozen chosen-modifier list for the receipt (name + delta per modifier).
+  modifiersSnapshot     Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  charges OrderCharge[]
+
+  @@index([tenantId])
+  @@index([orderId])
+  @@index([variantId])
+  @@map("order_items")
+}
+
+/// Design §6.2 — one persisted component of the bill breakdown. While the order
+/// is pre-BILLED these rows are working state: recomputed and rewritten
+/// (delete-then-insert) on every mutation. At BILLED they freeze (the Bill
+/// snapshot moment, §7.1). `amount` is signed minor units; `basis` is the amount
+/// the rate applied to; `rateBp` is basis points (1100 = 11%) or null for
+/// flat rows (ROUNDING, fixed discounts).
+model OrderCharge {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  orderId  String @db.Uuid
+
+  kind      OrderChargeKind
+  label     String
+  basis     BigInt
+  rateBp    Int?
+  amount    BigInt
+  taxable   Boolean
+  sortOrder Int
+
+  /// Set only for an item-level DISCOUNT (§6.4) — the line it reduces. Null for
+  /// order-level discounts and every derived row (service charge, tax, rounding,
+  /// gratuity). Lets a delete-then-insert recompute re-target item discounts to
+  /// their line rather than losing which line was discounted.
+  orderItemId String? @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order     Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem OrderItem? @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([orderId])
+  @@index([orderItemId])
+  @@map("order_charges")
 }

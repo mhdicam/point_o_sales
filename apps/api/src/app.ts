@@ -31,6 +31,7 @@ import {
 } from './routes/product.routes.js'
 import { createModifierRouter, createProductModifierRouter } from './routes/modifier.routes.js'
 import { createPriceRouter } from './routes/price.routes.js'
+import { createOrderRouter } from './routes/order.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
 export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
@@ -107,6 +108,7 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // POST /products/:id/modifier-groups to attach, GET to list, DELETE to detach.
   app.use('/products', createProductModifierRouter(db))
   app.use('/prices', createPriceRouter(db))
+  app.use('/orders', createOrderRouter(db))
 
   // S2-04/S2-07 — reference wiring for the two guards. Real feature routes
   // replace this in S3+.

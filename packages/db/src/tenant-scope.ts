@@ -52,6 +52,10 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'ProductModifierGroup',
   'PriceList',
   'PriceListItem',
+  // Order — S4
+  'Order',
+  'OrderItem',
+  'OrderCharge',
 ])
 
 /**

@@ -35,7 +35,22 @@ packages/db     — Prisma schema + generated client
 
 ## Commands
 
-**None exist yet.** Sprint 0 (`S0-01`–`S0-07`) defines the target: `pnpm install && pnpm dev` must bring up API + frontends + Postgres (Docker Compose) in one command, and CI runs `typecheck → lint → test → build`. When you scaffold this, update this section with the real commands.
+Scaffolded in Sprint 0. Run from the repo root; all delegate to Turborepo across the workspaces.
+
+**Setup & run**
+- `pnpm install` — install workspace deps (mutates the lockfile; ask before running).
+- `pnpm db:up` — start the Postgres container (Docker Compose). `pnpm db:down` to stop.
+- `pnpm db:migrate` / `pnpm db:generate` / `pnpm db:seed` / `pnpm db:reset` — Prisma against `packages/db`.
+- `pnpm dev` — bring up API + frontends in watch mode.
+
+**CI gate** (must be green; `typecheck → lint → test → build`)
+- `pnpm typecheck` · `pnpm lint` · `pnpm test` · `pnpm build`
+- `pnpm format:check` — Prettier.
+
+**Scoping to one workspace / one test**
+- `pnpm --filter @brewsync/api test` — run just the API suite (Vitest).
+- `pnpm --filter @brewsync/api exec vitest run src/path/to/file.test.ts` — a single file.
+- Workspace names: `@brewsync/api`, `@brewsync/pos`, `@brewsync/shared`, `@brewsync/db` (and the `pos` app).
 
 ## The seven non-negotiable standards
 

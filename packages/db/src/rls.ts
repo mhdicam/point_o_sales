@@ -68,4 +68,8 @@ export const RLS_TABLES = [
   'product_modifier_groups',
   'price_lists',
   'price_list_items',
+  // Order — S4
+  'orders',
+  'order_items',
+  'order_charges',
 ] as const

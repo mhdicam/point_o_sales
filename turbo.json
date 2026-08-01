@@ -17,7 +17,9 @@
     "CORS_ORIGINS",
     "OUTBOX_POLL_INTERVAL_MS",
     "OUTBOX_BATCH_SIZE",
-    "PLATFORM_API_TOKEN"
+    "PLATFORM_API_TOKEN",
+    "VITE_API_URL",
+    "VITE_API_PROXY_TARGET"
   ],
   "tasks": {
     "build": {

@@ -105,6 +105,11 @@ export class SessionService {
     const membership = await runUnscoped(
       async () =>
         await this.db.tenantMembership.findFirst({
+          // Legitimate manual tenant filter (standard #1 exception): this runs
+          // under runUnscoped because the user is not yet scoped into any tenant
+          // — they are requesting to be. The extension injects nothing here, so
+          // the membership must be matched to the requested tenant by hand.
+          // eslint-disable-next-line no-restricted-syntax -- pre-scope membership check, see above
           where: { userId, tenantId, status: 'ACTIVE' },
           select: { id: true },
         })

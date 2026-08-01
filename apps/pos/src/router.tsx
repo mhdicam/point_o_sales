@@ -12,6 +12,7 @@
 import { lazy, Suspense } from 'react'
 import type { ReactNode } from 'react'
 import { createBrowserRouter, Navigate } from 'react-router-dom'
+import type { RouterProviderProps } from 'react-router-dom'
 import { RequireScope } from './routes/RequireScope.tsx'
 import { AdminLayout } from './routes/AdminLayout.tsx'
 import { LoginScreen } from './routes/LoginScreen.tsx'
@@ -38,7 +39,7 @@ function Lazy({ children }: { children: ReactNode }): ReactNode {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>
 }
 
-export const router = createBrowserRouter([
+export const router: RouterProviderProps['router'] = createBrowserRouter([
   { path: '/login', element: <LoginScreen /> },
   { path: '/select-scope', element: <SelectScopeScreen /> },
   {
