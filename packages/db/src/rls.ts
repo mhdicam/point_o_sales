@@ -61,6 +61,7 @@ export const RLS_TABLES = [
   'units',
   'categories',
   'products',
+  'product_images',
   'product_variants',
   'modifier_groups',
   'modifiers',

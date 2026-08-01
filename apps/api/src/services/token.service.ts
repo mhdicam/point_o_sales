@@ -101,6 +101,10 @@ export class TokenService {
         tokenHash: hashToken(refreshToken),
         familyId: familyId ?? randomBytes(16).toString('hex'),
         expiresAt: new Date(Date.now() + parseDuration(this.config.JWT_REFRESH_TTL)),
+        // Persist the selected context so rotation can re-mint the same scope
+        // instead of demoting the session to tenant-less (S2-09).
+        scopeTenantId: claims.tenantId ?? null,
+        scopeOutletId: claims.outletId ?? null,
       },
     })
 
@@ -147,8 +151,11 @@ export class TokenService {
     return this.issue(
       {
         sub: existing.userId,
-        // RefreshToken doesn't carry tenant/outlet context — those come from
-        // tenant selection after login, not from the token itself.
+        // Carry the selected tenant/outlet across rotation, so a long-lived
+        // session keeps the scope it picked at login instead of silently
+        // losing access to every tenant-scoped route (S2-09).
+        tenantId: existing.scopeTenantId ?? undefined,
+        outletId: existing.scopeOutletId ?? undefined,
       },
       existing.familyId
     )

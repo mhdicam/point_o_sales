@@ -46,6 +46,7 @@ model Tenant {
   units                 Unit[]
   categories            Category[]
   products              Product[]
+  productImages         ProductImage[]
   productVariants       ProductVariant[]
   modifierGroups        ModifierGroup[]
   modifiers             Modifier[]
@@ -273,6 +274,16 @@ model RefreshToken {
   /// the whole family is revoked rather than just that call (S1-05).
   familyId String @default(uuid()) @db.Uuid
 
+  /// Tenant/outlet the session was scoped to, so rotation can re-mint an access
+  /// token with the same context instead of silently demoting the session to
+  /// tenant-less (S2-09). Deliberately NOT named `tenantId`: RefreshToken is a
+  /// global model (see GLOBAL_MODELS in tenant-scope.ts) and must stay outside
+  /// RLS — a login has to be readable before any tenant is known. The `scope`
+  /// prefix keeps a future reader from mistaking these for ownership columns.
+  /// Null means the session has not selected a tenant yet.
+  scopeTenantId String? @db.Uuid
+  scopeOutletId String? @db.Uuid
+
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
@@ -422,7 +433,6 @@ model Product {
   /// Tenant-unique handle used by imports and the public catalog URL.
   slug        String
   description String?
-  imageUrl    String?
 
   /// Design §2.1 — the single data point that decides whether an item needs
   /// stock, a recipe, KDS routing, or a time slot. Never branch on a vertical
@@ -439,11 +449,55 @@ model Product {
   category       Category?              @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   variants       ProductVariant[]
   modifierGroups ProductModifierGroup[]
+  images         ProductImage[]
 
   @@unique([tenantId, slug])
   @@index([tenantId])
   @@index([categoryId])
   @@map("products")
+}
+
+/// Multi-image for a product (design §16.1 lists a photo in the catalog showcase
+/// but does not model it; a child table is the choice recorded here).
+///
+/// A child table rather than a JSON array so ordering, alt text and the cover
+/// flag are columns — queryable, indexable, and individually updatable without
+/// rewriting the whole set.
+///
+/// Scope: Product only. Per-variant images are deliberately not modelled yet —
+/// nothing in the design doc asks for them, and adding a nullable `variantId`
+/// later is an additive migration. Do not work around this by encoding a variant
+/// into `alt`.
+model ProductImage {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  productId String @db.Uuid
+
+  /// Storage-agnostic URL. Upload/object storage is out of scope for S3 — the
+  /// API takes a URL the caller already has. When storage lands, this column
+  /// keeps working and gains siblings (bucket key, width/height) beside it.
+  url String
+  /// Accessibility text. Not derived from the product name: the catalog is
+  /// public and an image often shows something the name does not say.
+  alt String?
+
+  /// Explicit, not "row 0 is the cover". Insertion order is not a promise
+  /// Postgres makes, and reordering images must not silently move the cover.
+  /// Exactly one cover per product, enforced in product.service (same shape as
+  /// ProductVariant.isDefault) — a partial unique index would be invisible to
+  /// Prisma and show up as schema drift.
+  isCover   Boolean @default(false)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([productId])
+  @@map("product_images")
 }
 
 /// Design §2.1 — STOCKED needs stock, MADE_TO_ORDER needs a recipe + KDS route,

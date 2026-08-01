@@ -4,6 +4,9 @@ export default defineConfig({
   test: {
     include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
     environment: 'node',
+    // Pinned so an ambient NODE_ENV from the shell cannot leak in — see the note
+    // in apps/api/vitest.config.ts.
+    env: { NODE_ENV: 'test' },
     testTimeout: 10000,
   },
 })

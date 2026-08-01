@@ -18,12 +18,17 @@ import { createAuthRouter, errorHandler } from './routes/auth.routes.js'
 import { createHealthRouter } from './routes/health.routes.js'
 import { createPinRouter } from './routes/pin.routes.js'
 import { createMeRouter } from './routes/me.routes.js'
+import { createSessionRouter } from './routes/session.routes.js'
 import { createExampleRouter } from './routes/example.routes.js'
 import { createRoleRouter } from './routes/role.routes.js'
 import { createOnboardingRouter } from './routes/onboarding.routes.js'
 import { createCategoryRouter } from './routes/category.routes.js'
 import { createUnitRouter } from './routes/unit.routes.js'
-import { createProductRouter, createVariantRouter } from './routes/product.routes.js'
+import {
+  createProductRouter,
+  createVariantRouter,
+  createImageRouter,
+} from './routes/product.routes.js'
 import { createModifierRouter, createProductModifierRouter } from './routes/modifier.routes.js'
 import { createPriceRouter } from './routes/price.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
@@ -79,6 +84,11 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // S1-02 — binds tenant context from the JWT for the Prisma extension.
   app.use(createTenantMiddleware(config))
 
+  // S2-09 — tenant selection. Mounted here (token required) but deliberately
+  // NOT behind requireTenant: an email/password session holds no tenant yet,
+  // and this is the route that gives it one.
+  app.use('/session', createSessionRouter(db, config))
+
   // S2-03/S2-05 — effective permissions, consumed by the FE usePermission hook.
   app.use('/me', createMeRouter(db))
 
@@ -91,6 +101,7 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   app.use('/units', createUnitRouter(db))
   app.use('/products', createProductRouter(db))
   app.use('/variants', createVariantRouter(db))
+  app.use('/images', createImageRouter(db))
   app.use('/modifiers', createModifierRouter(db))
   // Product-modifier attachment routes sit under /products for readability:
   // POST /products/:id/modifier-groups to attach, GET to list, DELETE to detach.

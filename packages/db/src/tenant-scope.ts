@@ -45,6 +45,7 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Unit',
   'Category',
   'Product',
+  'ProductImage',
   'ProductVariant',
   'ModifierGroup',
   'Modifier',
@@ -118,7 +119,7 @@ export function createTenantScopeExtension() {
             }
 
             const { tenantId } = context
-            const typedArgs = scopeArgs(operation, args as Record<string, unknown>, tenantId)
+            const typedArgs = scopeArgs(operation, args as Record<string, unknown>, tenantId, model)
 
             // An outer withTenantTransaction already bound the GUC on this
             // connection; reuse it rather than nesting a transaction.
@@ -154,6 +155,15 @@ export function createTenantScopeExtension() {
 /**
  * Applies the tenant filter/value appropriate to the operation.
  *
+ * Writes recurse. Prisma lets a single `create` build a whole subtree
+ * (`product.create({ data: { …, variants: { create: [...] } } })`), and every
+ * row in that subtree needs its own `tenantId`. Injecting only at the top level
+ * left the nested rows without one, and because their generated types require
+ * the `tenant` relation, Prisma rejected the whole call with "Argument `tenant`
+ * is missing." before any SQL ran — so nested creates never worked at all. The
+ * alternative (services passing `tenantId` by hand into nested rows) is exactly
+ * what standard #1 forbids.
+ *
  * @internal Exported only so the S1-07 isolation suite can assert layer one on
  * its own. With RLS active, removing this injection would still return correct
  * rows, so an integration test cannot detect a layer-one regression — it has to
@@ -162,10 +172,30 @@ export function createTenantScopeExtension() {
 export function scopeArgs(
   operation: string,
   args: Record<string, unknown>,
-  tenantId: string
+  tenantId: string,
+  model: string
 ): Record<string, unknown> {
   if (READ_OPS.has(operation) || MUTATING_WHERE_OPS.has(operation)) {
     args['where'] = mergeTenantFilter(args['where'], tenantId)
+    // updateMany/deleteMany take scalar-only `data`; no subtree to walk.
+    return args
+  }
+
+  if (operation === 'create') {
+    args['data'] = scopeWriteData(model, args['data'], tenantId, true)
+    return args
+  }
+
+  if (operation === 'createMany' || operation === 'createManyAndReturn') {
+    args['data'] = mapEach(args['data'], (row) => scopeWriteData(model, row, tenantId, true))
+    return args
+  }
+
+  if (operation === 'upsert') {
+    args['create'] = scopeWriteData(model, args['create'], tenantId, true)
+    if ('update' in args) {
+      args['update'] = scopeWriteData(model, args['update'], tenantId, false)
+    }
     return args
   }
 
@@ -174,24 +204,12 @@ export function scopeArgs(
     // tenantId cannot simply be merged in. RLS covers these: with the GUC bound,
     // Postgres returns no row for another tenant's id, so the result is the same
     // (null / RecordNotFound) without guessing at compound-key shapes.
-    return args
-  }
-
-  if (operation === 'create') {
-    args['data'] = withTenantId(args['data'], tenantId)
-    return args
-  }
-
-  if (operation === 'createMany' || operation === 'createManyAndReturn') {
-    const data = args['data']
-    args['data'] = Array.isArray(data)
-      ? data.map((row) => withTenantId(row, tenantId))
-      : withTenantId(data, tenantId)
-    return args
-  }
-
-  if (operation === 'upsert') {
-    args['create'] = withTenantId(args['create'], tenantId)
+    //
+    // `update` still needs its data walked — the row itself keeps the tenantId
+    // it was created with, but a nested `create` underneath it is a new row.
+    if ('data' in args) {
+      args['data'] = scopeWriteData(model, args['data'], tenantId, false)
+    }
     return args
   }
 
@@ -210,12 +228,145 @@ function mergeTenantFilter(where: unknown, tenantId: string): Record<string, unk
   return { ...(where as Record<string, unknown>), tenantId }
 }
 
-function withTenantId(data: unknown, tenantId: string): Record<string, unknown> {
-  if (data === null || data === undefined || typeof data !== 'object') {
-    return { tenantId }
+/**
+ * relation field → target model, per model, from the generated data model.
+ *
+ * Derived rather than hand-listed: the walker has to know whether `images` on
+ * Product points at a tenant-scoped model or a global one, and a hand-kept map
+ * would drift the first time someone adds a relation.
+ */
+let relationsByModel: Map<string, Map<string, string>> | null = null
+
+function relationsOf(model: string): Map<string, string> {
+  if (!relationsByModel) {
+    relationsByModel = new Map()
+    for (const entry of Prisma.dmmf.datamodel.models) {
+      const relations = new Map<string, string>()
+      for (const field of entry.fields) {
+        if (field.kind === 'object') {
+          relations.set(field.name, field.type)
+        }
+      }
+      relationsByModel.set(entry.name, relations)
+    }
   }
-  const record = data as Record<string, unknown>
-  // A nested `tenant: { connect: … }` is the caller being explicit; leave it.
-  if ('tenant' in record) return record
-  return { ...record, tenantId }
+  return relationsByModel.get(model) ?? new Map()
+}
+
+/**
+ * Injects tenantId into a write payload and into every tenant-scoped row nested
+ * beneath it.
+ *
+ * `injectSelf` is false when the payload updates an existing row: that row
+ * already carries its tenantId, and writing it again would let a caller move a
+ * row between tenants. Its nested creates are still walked.
+ */
+function scopeWriteData(
+  model: string,
+  data: unknown,
+  tenantId: string,
+  injectSelf: boolean
+): unknown {
+  if (!isRecord(data)) {
+    return injectSelf ? { tenantId } : data
+  }
+
+  const out: Record<string, unknown> = { ...data }
+  const relations = relationsOf(model)
+
+  for (const key of Object.keys(out)) {
+    const target = relations.get(key)
+    if (target === undefined || !TENANT_SCOPED_MODELS.has(target)) continue
+    if (!isRecord(out[key])) continue
+    out[key] = scopeNestedWrite(target, out[key] as Record<string, unknown>, tenantId)
+  }
+
+  if (injectSelf && !('tenant' in out)) {
+    // A nested `tenant: { connect: … }` is the caller being explicit; leave it.
+    out['tenantId'] = tenantId
+  }
+
+  return out
+}
+
+/**
+ * Walks one nested-relation payload, e.g. the `{ create: [...] }` under
+ * `variants`.
+ *
+ * `connect` / `disconnect` / `set` are deliberately untouched: they reference
+ * rows that already exist, and RLS `USING` is what stops a cross-tenant id
+ * there. Only the verbs that produce or modify rows are rewritten.
+ */
+function scopeNestedWrite(
+  target: string,
+  nested: Record<string, unknown>,
+  tenantId: string
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...nested }
+
+  if ('create' in out) {
+    out['create'] = mapEach(out['create'], (row) => scopeWriteData(target, row, tenantId, true))
+  }
+
+  if (isRecord(out['createMany'])) {
+    const createMany: Record<string, unknown> = { ...out['createMany'] }
+    createMany['data'] = mapEach(createMany['data'], (row) =>
+      scopeWriteData(target, row, tenantId, true)
+    )
+    out['createMany'] = createMany
+  }
+
+  if ('connectOrCreate' in out) {
+    out['connectOrCreate'] = mapEach(out['connectOrCreate'], (entry) =>
+      rewriteBranches(target, entry, tenantId, ['create'])
+    )
+  }
+
+  if ('upsert' in out) {
+    out['upsert'] = mapEach(out['upsert'], (entry) =>
+      rewriteBranches(target, entry, tenantId, ['create', 'update'])
+    )
+  }
+
+  if ('update' in out) {
+    out['update'] = mapEach(out['update'], (entry) => {
+      // To-many form is { where, data }; to-one form is the data itself.
+      if (isRecord(entry) && 'data' in entry) {
+        return rewriteBranches(target, entry, tenantId, ['data'])
+      }
+      return scopeWriteData(target, entry, tenantId, false)
+    })
+  }
+
+  // updateMany's `data` is scalar-only, so there is nothing nested to reach.
+
+  return out
+}
+
+/** Rewrites named sub-payloads of one entry; `create` injects, the rest do not. */
+function rewriteBranches(
+  target: string,
+  entry: unknown,
+  tenantId: string,
+  branches: readonly string[]
+): unknown {
+  if (!isRecord(entry)) return entry
+
+  const out: Record<string, unknown> = { ...entry }
+  for (const branch of branches) {
+    if (!(branch in out)) continue
+    out[branch] = mapEach(out[branch], (row) =>
+      scopeWriteData(target, row, tenantId, branch === 'create')
+    )
+  }
+  return out
+}
+
+/** Applies `fn` to a payload that Prisma accepts as either one object or a list. */
+function mapEach(value: unknown, fn: (row: unknown) => unknown): unknown {
+  return Array.isArray(value) ? value.map((row) => fn(row)) : fn(value)
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

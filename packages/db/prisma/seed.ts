@@ -1,10 +1,14 @@
 /**
  * Seed — S0-03 skeleton, S2-01 (permission catalog), S2-02 (preset roles),
- * S2-08 (tenant provisioning), plus one demo tenant per vertical so the
- * "one core, many shapes" claim is visible in the UI (S3-06 extends this).
+ * S2-08 (tenant provisioning), S3-06 (master product catalog per vertical), plus
+ * one demo tenant per vertical so the "one core, many shapes" claim is visible in
+ * the UI.
  *
  * Runs as the migration/owner role: seeding is deliberately cross-tenant, so it
  * uses the unscoped client and sets the RLS GUC per tenant as it goes.
+ *
+ * The per-vertical catalog data lives in ../src/seed-catalog.ts because this file
+ * sits outside the package tsconfig `include` and is never typechecked.
  */
 
 import { fileURLToPath } from 'node:url'
@@ -14,6 +18,7 @@ import { PrismaClient } from '../generated/client/index.js'
 import { PRESET_ROLES, defaultFeaturesFor, type BusinessPreset } from '@brewsync/shared'
 import { hash } from '@node-rs/argon2'
 import { seedPermissionCatalog } from '../src/seed-permissions.js'
+import { seedMasterCatalog } from '../src/seed-catalog.js'
 
 // The seed runs from packages/db but .env lives at the workspace root.
 loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
@@ -192,7 +197,18 @@ async function main() {
       }
     }
 
+    // S3-06 — master product catalog. Runs last in the loop because price lists
+    // reference outlets, and still inside it because the GUC bound above is what
+    // lets these tenant-scoped rows through RLS.
+    const catalog = await seedMasterCatalog(prisma, tenant.id, spec.slug)
+
     console.log(`  ${spec.outlets.length} outlet(s), ${PRESET_ROLES.length} roles, 2 users`)
+    console.log(
+      `  ${catalog.units} units, ${catalog.categories} categories, ` +
+        `${catalog.products} products / ${catalog.variants} variants, ` +
+        `${catalog.images} images, ${catalog.modifierGroups} modifier groups, ` +
+        `${catalog.priceLists} price lists`
+    )
   }
 
   console.log('\n✔ Seed complete. Demo logins (password: password123, PIN: 1234):')

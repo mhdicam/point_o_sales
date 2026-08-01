@@ -136,6 +136,46 @@ Two roles:
 
 Fixtures are built by the owner role with `set_config('app.current_tenant', ...)` so writes pass RLS `WITH CHECK`. Tests clean up their own data in `afterAll`.
 
+#### The role split is what makes layer two observable
+
+Postgres exempts three kinds of connection from RLS: **superusers**, roles with **BYPASSRLS**, and a table's **owner** (unless `FORCE ROW LEVEL SECURITY` is set, which it is). Point `TEST_DATABASE_URL` at any of them and the layer-two tests stop proving anything — historically they went green while enforcing nothing, then went red in a way that looked like an RLS bug.
+
+`tenant-isolation.test.ts` opens with a "Harness preconditions" block that asserts the app role is non-superuser, `NOBYPASSRLS`, and owns no tables, and that the owner client really owns every tenant-scoped table. If that block is red, fix the environment before reading any failure below it.
+
+#### Applying migrations to the test database
+
+Do **not** override `DATABASE_URL` with a superuser URL to migrate `brewsync_test`. Objects are owned by whoever creates them, so migrating as `postgres` leaves tables owned by `postgres` with **no grants for the owner role** — fixture writes then fail, and `FORCE` binds a superuser that is exempt anyway.
+
+Migrate with the owner role, which is what `TEST_DIRECT_DATABASE_URL` is for:
+
+```bash
+cd packages/db && DATABASE_URL="$TEST_DATABASE_URL" DIRECT_DATABASE_URL="$TEST_DIRECT_DATABASE_URL" pnpm migrate:deploy
+```
+
+If ownership has already drifted, reassign it in one statement (run as the wrong owner or a superuser):
+
+```bash
+psql "$TEST_DIRECT_DATABASE_URL" -c "REASSIGN OWNED BY postgres TO brewsync_owner;"
+```
+
+This moves tables, indexes and enum types together. Verify with the preconditions block.
+
+#### Local Postgres roles
+
+`docker compose up` (port **5433**) provisions the roles in `.env.example` automatically. On a local Homebrew instance (port **5432**) create the owner role and the two databases once — `brewsync_app` is created for you by the RLS migration:
+
+```bash
+createuser --createdb --pwprompt brewsync_owner
+```
+
+Then create both databases owned by it:
+
+```bash
+createdb -O brewsync_owner brewsync_dev && createdb -O brewsync_owner brewsync_test
+```
+
+Neither role may be `SUPERUSER` or hold `BYPASSRLS`. Use the passwords from your `.env`; if your `pg_hba.conf` uses `trust` locally the password is set but not checked, which is fine — the harness asserts role *attributes*, not the auth method.
+
 ### Every bug gets a reproducing test before the fix
 
 A failed test that captures the bug proves the fix.
