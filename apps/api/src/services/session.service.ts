@@ -42,12 +42,19 @@ export class SessionService {
    * result — it comes from the verified token, never from the request body.
    */
   async listMemberships(userId: string): Promise<MembershipSummary[]> {
-    const memberships = await runUnscoped(() =>
-      this.db.tenantMembership.findMany({
-        where: { userId, status: 'ACTIVE' },
-        include: { tenant: { select: { id: true, name: true, slug: true } } },
-        orderBy: { joinedAt: 'asc' },
-      })
+    // The inner `await` is load-bearing, exactly as on the scoped reads below: a
+    // Prisma delegate returns a lazy promise that only dispatches on `.then()`,
+    // so returning it unawaited lets the runUnscoped frame exit first. The query
+    // would then run under the caller's context — which, post-login, carries an
+    // empty-string tenantId — and the extension would inject `tenantId: ''`,
+    // failing as an invalid UUID rather than reading across tenants.
+    const memberships = await runUnscoped(
+      async () =>
+        await this.db.tenantMembership.findMany({
+          where: { userId, status: 'ACTIVE' },
+          include: { tenant: { select: { id: true, name: true, slug: true } } },
+          orderBy: { joinedAt: 'asc' },
+        })
     )
 
     if (memberships.length === 0) return []
@@ -93,11 +100,14 @@ export class SessionService {
     tenantId: string,
     outletId?: string | undefined
   ): Promise<SelectedScope> {
-    const membership = await runUnscoped(() =>
-      this.db.tenantMembership.findFirst({
-        where: { userId, tenantId, status: 'ACTIVE' },
-        select: { id: true },
-      })
+    // Load-bearing inner `await` — see listMemberships. Without it this runs
+    // under the caller's empty-string tenant context, not runUnscoped.
+    const membership = await runUnscoped(
+      async () =>
+        await this.db.tenantMembership.findFirst({
+          where: { userId, tenantId, status: 'ACTIVE' },
+          select: { id: true },
+        })
     )
 
     // Same message for "not a member" and "no such tenant": telling the two

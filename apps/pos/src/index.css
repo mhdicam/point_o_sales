@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Design tokens as RGB triples so Tailwind's `<alpha-value>` slot works.
+ * Light palette only for now; a dark/kitchen theme can override :root later.
+ */
+:root {
+  --color-brand: 37 99 235; /* blue-600 */
+  --color-surface: 255 255 255;
+  --color-surface-muted: 244 245 247;
+  --color-ink: 17 24 39; /* gray-900 */
+  --color-ink-muted: 107 114 128; /* gray-500 */
+  --color-line: 226 232 240; /* slate-200 */
+  --color-danger: 220 38 38; /* red-600 */
+
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--color-surface-muted));
+  color: rgb(var(--color-ink));
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Catalog/list motion honors the accessibility setting (design §19). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
