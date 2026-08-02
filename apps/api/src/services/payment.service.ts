@@ -35,6 +35,7 @@ import { EVENT_TYPES, allocate, allocateByWeights } from '@brewsync/shared'
 import { badRequest, conflict, notFound } from '../http-error.js'
 import { computeTender, TenderError } from './payment.settle.js'
 import { ShiftService } from './shift.service.js'
+import { StockDeductionService } from './stock-deduction.service.js'
 
 type Tx = Prisma.TransactionClient
 
@@ -334,7 +335,11 @@ export class PaymentService {
    * charges, payments — so a consumer (Accounting, Loyalty) never queries back
    * into POS (§8.2). Money fields are serialized as strings by the outbox.
    */
-  private async settleOrderIfFullyPaid(tx: Tx, orderId: string, ctx: { tenantId: string }) {
+  private async settleOrderIfFullyPaid(
+    tx: Tx,
+    orderId: string,
+    ctx: { tenantId: string; userId?: string | null }
+  ) {
     const bills = await tx.bill.findMany({
       where: { orderId },
       include: { payments: { orderBy: { createdAt: 'asc' } } },
@@ -352,6 +357,19 @@ export class PaymentService {
     if (order.status !== 'BILLED') return // already PAID/closed by a concurrent path
 
     await tx.order.update({ where: { id: orderId }, data: { status: 'PAID' } })
+
+    // Stock deduction at PAID (§4.2) — a no-op unless the outlet deducts at PAID.
+    // Idempotent on ('order', orderId): a retried settle never double-deducts.
+    await new StockDeductionService(tx as unknown as BrewsyncClient).deductForOrder(
+      tx,
+      {
+        id: orderId,
+        outletId: order.outletId,
+        items: order.items.map((i) => ({ variantId: i.variantId, qty: i.qty })),
+      },
+      'PAID',
+      ctx.userId ?? null
+    )
 
     await emitEvent(tx as unknown as OutboxCapableTx, {
       tenantId: ctx.tenantId,
@@ -393,7 +411,7 @@ export class PaymentService {
     })
   }
 
-  private async loadBill(client: Tx | BrewsyncClient, billId: string) {
+  private async loadBill(client: Tx, billId: string) {
     const bill = await client.bill.findUnique({
       where: { id: billId },
       include: { payments: { orderBy: { createdAt: 'asc' } } },

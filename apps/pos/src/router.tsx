@@ -34,6 +34,15 @@ const ModifiersScreen = lazy(() =>
 const PriceListsScreen = lazy(() =>
   import('./routes/PriceListsScreen.tsx').then((m) => ({ default: m.PriceListsScreen }))
 )
+const SuppliersScreen = lazy(() =>
+  import('./routes/SuppliersScreen.tsx').then((m) => ({ default: m.SuppliersScreen }))
+)
+const InventoryScreen = lazy(() =>
+  import('./routes/InventoryScreen.tsx').then((m) => ({ default: m.InventoryScreen }))
+)
+const PurchaseOrdersScreen = lazy(() =>
+  import('./routes/PurchaseOrdersScreen.tsx').then((m) => ({ default: m.PurchaseOrdersScreen }))
+)
 const OrderScreen = lazy(() =>
   import('./routes/order/OrderScreen.tsx').then((m) => ({ default: m.OrderScreen }))
 )
@@ -73,6 +82,9 @@ export const router: RouterProviderProps['router'] = createBrowserRouter([
         { path: 'units', element: <Lazy><UnitsScreen /></Lazy> },
         { path: 'modifiers', element: <Lazy><ModifiersScreen /></Lazy> },
         { path: 'prices', element: <Lazy><PriceListsScreen /></Lazy> },
+        { path: 'suppliers', element: <Lazy><SuppliersScreen /></Lazy> },
+        { path: 'inventory', element: <Lazy><InventoryScreen /></Lazy> },
+        { path: 'purchase-orders', element: <Lazy><PurchaseOrdersScreen /></Lazy> },
       ] },
     ],
   },

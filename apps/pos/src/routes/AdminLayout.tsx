@@ -27,9 +27,13 @@ function useNavItems(): NavItem[] {
   const canShift = usePermission(PERMISSIONS.SHIFT_OPEN)
   const canTable = usePermission(PERMISSIONS.TABLE_MANAGE)
   const canKds = usePermission(PERMISSIONS.KDS_BUMP)
+  const canSupplier = usePermission(PERMISSIONS.SUPPLIER_MANAGE)
+  const canInventory = usePermission(PERMISSIONS.INVENTORY_VIEW)
+  const canPurchase = usePermission(PERMISSIONS.PURCHASE_CREATE)
   const modifiersOn = useFeature('modifiers')
   const tablesOn = useFeature('tables')
   const kdsOn = useFeature('kds')
+  const purchasingOn = useFeature('purchasing')
   return [
     { to: '/admin/order', label: 'Order', show: canOrder },
     { to: '/admin/floor', label: 'Floor plan', show: canTable && tablesOn },
@@ -40,6 +44,9 @@ function useNavItems(): NavItem[] {
     { to: '/admin/units', label: 'Units', show: canProduct },
     { to: '/admin/modifiers', label: 'Modifiers', show: canProduct && modifiersOn },
     { to: '/admin/prices', label: 'Price lists', show: canPrice },
+    { to: '/admin/suppliers', label: 'Suppliers', show: canSupplier && purchasingOn },
+    { to: '/admin/inventory', label: 'Inventory', show: canInventory },
+    { to: '/admin/purchase-orders', label: 'Purchase orders', show: canPurchase && purchasingOn },
   ]
 }
 

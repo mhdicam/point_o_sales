@@ -4,6 +4,7 @@ import {
   fromBaseScaled,
   valuate,
   avgCostOf,
+  extendedCost,
   type StockLot,
 } from './inventory.js'
 import { UNIT_FACTOR_SCALE } from './unit.js'
@@ -121,5 +122,47 @@ describe('avgCostOf', () => {
   it('derives per-base-unit cost from value and on-hand', () => {
     // value 12000 minor over 20 base units → 600 per base unit.
     expect(avgCostOf(20n * SCALE, 12000n)).toBe(600n)
+  })
+})
+
+describe('extendedCost — per-movement COGS (§4.3)', () => {
+  const base = (n: bigint) => n * SCALE
+
+  it('multiplies whole base units by cost per unit', () => {
+    // 5 base units @ 600 minor per unit → 3000 minor.
+    expect(extendedCost(base(5n), 600n)).toBe(3000n)
+  })
+
+  it('negates for an outbound consumption row', () => {
+    // A SALE_CONSUMPTION of -5 base units @ 600 → -3000; negated = 3000 COGS.
+    expect(extendedCost(-base(5n), 600n)).toBe(-3000n)
+    expect(-extendedCost(-base(5n), 600n)).toBe(3000n)
+  })
+
+  it('handles a fractional consumption (0.5 base unit)', () => {
+    // 0.5 base unit @ 600 → 300 minor.
+    expect(extendedCost(SCALE / 2n, 600n)).toBe(300n)
+  })
+
+  it('rounds half away from zero', () => {
+    // 1 base-unit scaled residue that lands exactly on the half.
+    // qty = 1 (raw scaled residue), cost = SCALE/2 → numerator = SCALE/2,
+    // half of SCALE → rounds up to 1.
+    expect(extendedCost(1n, SCALE / 2n)).toBe(1n)
+    expect(extendedCost(-1n, SCALE / 2n)).toBe(-1n)
+  })
+
+  it('agrees with the fold valuate uses for consumption value', () => {
+    // 10 @ 500, 10 @ 700 (avg 600), consume 5 → value falls by extendedCost.
+    const before = valuate([
+      { qty: base(10n), costPerUnit: 500n },
+      { qty: base(10n), costPerUnit: 700n },
+    ])
+    const after = valuate([
+      { qty: base(10n), costPerUnit: 500n },
+      { qty: base(10n), costPerUnit: 700n },
+      { qty: -base(5n), costPerUnit: null },
+    ])
+    expect(after.value - before.value).toBe(extendedCost(-base(5n), 600n))
   })
 })

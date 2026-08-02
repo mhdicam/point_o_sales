@@ -27,6 +27,7 @@ import {
   avgCostOf,
   toBaseScaled,
   fromBaseScaled,
+  extendedCost,
   type StockLot,
 } from '@brewsync/shared'
 import { badRequest, notFound } from '../http-error.js'
@@ -58,6 +59,28 @@ export interface OnHand {
   value: bigint
 }
 
+/** Outlet-wide valuation summary — the grand total plus one line per variant. */
+export interface OutletValuation {
+  outletId: string
+  /** SUM of every variant's inventory value at this outlet, minor units. */
+  totalValue: bigint
+  /** Per-variant on-hand + value, highest value first. */
+  lines: OnHand[]
+}
+
+/** What a recorded movement reports back — id plus its snapshotted valuation. */
+export interface RecordedMovement {
+  id: string
+  /** Minor units per one base unit at the moment of the movement (snapshot). */
+  costPerUnit: bigint | null
+  /**
+   * Signed extended cost of the movement, minor units = qty * cost / SCALE. For
+   * a SALE_CONSUMPTION (qty < 0) this is negative; negate it for the positive
+   * COGS the movement contributes (§4.3).
+   */
+  extendedCost: bigint
+}
+
 export class StockService {
   constructor(private readonly db: BrewsyncClient) {}
 
@@ -72,7 +95,7 @@ export class StockService {
     })
     if (!variant) throw notFound('VARIANT_NOT_FOUND', `Variant ${variantId} not found.`)
 
-    const lots = await this.ledger(this.db, outletId, variantId)
+    const lots = await this.ledger(this.db as unknown as Tx, outletId, variantId)
     const v = valuate(lots)
     const factor = variant.stockUnit?.factor ?? null
     return {
@@ -149,6 +172,34 @@ export class StockService {
   }
 
   /**
+   * Outlet-wide inventory valuation (§4.3) — the on-hand + value of every variant
+   * that has ever moved at this outlet, each folded from its own ledger, plus the
+   * grand total value. Derived, never a stored balance (standard #3). The per-line
+   * `onHand`/`value` are the same figures a single-variant `onHand()` returns.
+   */
+  async outletValuation(outletId: string): Promise<OutletValuation> {
+    // Every variant with at least one movement here. Scoping is the extension's
+    // job (standard #1); this reads only rows for the request's tenant. We dedupe
+    // in JS rather than lean on Prisma `distinct` — the typed scalar-field enum
+    // pushes the dynamic-extension client past TS's instantiation-depth limit.
+    const rows = await this.db.stockMovement.findMany({
+      where: { outletId },
+      select: { variantId: true },
+    })
+    const variantIds = [...new Set(rows.map((r) => r.variantId))]
+    const lines: OnHand[] = []
+    let totalValue = 0n
+    for (const variantId of variantIds) {
+      const line = await this.onHand(outletId, variantId)
+      lines.push(line)
+      totalValue += line.value
+    }
+    // Highest-value first so the summary leads with what matters.
+    lines.sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0))
+    return { outletId, totalValue, lines }
+  }
+
+  /**
    * Appends one consumption/production/purchase movement inside a caller's
    * transaction (S6-02, S6-07). Kept `tx`-taking so it commits atomically with
    * the sale or receipt that drove it. `qtyBaseScaled` is already in scaled base
@@ -157,6 +208,8 @@ export class StockService {
    * For a SALE_CONSUMPTION the caller passes no cost; this method snapshots the
    * moving-average cost at this instant so historical COGS never shifts
    * (standard #7 spirit) — the fold that read `costPerUnit` back agrees exactly.
+   * Returns the id plus the snapshotted cost and its extended value so the sale
+   * path can total COGS from the exact figures it wrote (S6-04).
    */
   async recordMovement(
     tx: Tx,
@@ -170,7 +223,7 @@ export class StockService {
       refId?: string | null
       userId?: string | null
     }
-  ): Promise<string> {
+  ): Promise<RecordedMovement> {
     let cost = args.costPerUnit ?? null
     if (cost === null && args.type === 'SALE_CONSUMPTION') {
       const lots = await this.ledger(tx, args.outletId, args.variantId)
@@ -191,7 +244,11 @@ export class StockService {
       } as unknown as Prisma.StockMovementCreateInput,
       select: { id: true },
     })
-    return movement.id
+    return {
+      id: movement.id,
+      costPerUnit: cost,
+      extendedCost: cost === null ? 0n : extendedCost(args.qtyBaseScaled, cost),
+    }
   }
 
   /**
@@ -215,7 +272,7 @@ export class StockService {
 
   /** The valuation-ready ledger for a variant at an outlet, in creation order. */
   private async ledger(
-    client: Tx | BrewsyncClient,
+    client: Tx,
     outletId: string,
     variantId: string
   ): Promise<StockLot[]> {

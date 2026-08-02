@@ -457,3 +457,143 @@ export interface Shift {
   /** SUM(movements.amount), minor units — decimal string. */
   drawerBalance: string
 }
+
+/**
+ * A vendor (design §4.4, S6-05). Master data shared across every outlet; PO
+ * lines reference it. `code` is the fast-lookup handle, frozen after create.
+ * Per-item buy prices are NOT here — they live on PO lines (they move every
+ * transaction). Deactivated, never deleted, so historical POs still resolve.
+ */
+export interface Supplier {
+  id: string
+  code: string
+  name: string
+  contactName: string | null
+  phone: string | null
+  email: string | null
+  address: string | null
+  /** NPWP — input-tax invoice. */
+  taxId: string | null
+  /** 0 = cash, 30 = net-30. */
+  paymentTermDays: number
+  defaultCurrency: string
+  isActive: boolean
+  notes: string | null
+}
+
+// ---- Inventory (S6-01/04, design §4) ----
+
+export type StockMovementType =
+  | 'ADJUSTMENT'
+  | 'WASTE'
+  | 'TRANSFER'
+  | 'PRODUCTION'
+  | 'SALE_CONSUMPTION'
+  | 'PURCHASE'
+
+/**
+ * On-hand + valuation for one variant at one outlet, folded from the ledger
+ * (§4.3, standard #3). Every figure is server-derived — the FE renders, never
+ * sums. Quantities are scaled (base or stock unit × 1e6); money is minor units.
+ * All BigInt → decimal string on the wire.
+ */
+export interface OnHand {
+  variantId: string
+  outletId: string
+  /** On-hand in scaled base units (SUM of the ledger). Decimal string. */
+  onHandBaseScaled: string
+  /** On-hand in the variant's stock unit, scaled. What the FE displays. */
+  onHandStockScaled: string
+  /** Moving-average cost per one base unit, minor units. Decimal string. */
+  avgCost: string
+  /** Inventory value, minor units. Decimal string. */
+  value: string
+}
+
+/** Outlet-wide valuation: the grand total plus one on-hand line per variant. */
+export interface OutletValuation {
+  outletId: string
+  /** SUM of every variant's value, minor units. Decimal string. */
+  totalValue: string
+  /** Per-variant on-hand + value, highest value first. */
+  lines: OnHand[]
+}
+
+/** One append-only stock ledger row (audit/inventory-card view). */
+export interface StockMovement {
+  id: string
+  outletId: string
+  variantId: string
+  type: StockMovementType
+  /** Signed scaled base units. Decimal string. */
+  qty: string
+  /** Minor units per one base unit at the movement, or null. Decimal string. */
+  costPerUnit: string | null
+  refType: string | null
+  refId: string | null
+  reason: string | null
+  createdAt: string
+}
+
+// ---- Purchase order (S6-06/07/08, design §4.5) ----
+
+export type PurchaseOrderStatus =
+  | 'DRAFT'
+  | 'SUBMITTED'
+  | 'APPROVED'
+  | 'RECEIVING'
+  | 'RECEIVED'
+  | 'CLOSED'
+  | 'CANCELLED'
+
+/**
+ * One PO line. `qtyOrderedScaled`/`qtyReceivedScaled` are scaled base units
+ * (× 1e6); `unitCost`/`lineTotal` are minor units. `lineTotalPreview` is the
+ * server's live extendedCost while DRAFT and equals the frozen `lineTotal` once
+ * APPROVED. All BigInt → decimal string.
+ */
+export interface PurchaseOrderItem {
+  id: string
+  poId: string
+  variantId: string
+  qtyOrderedScaled: string
+  qtyReceivedScaled: string
+  unitCost: string
+  lineTotal: string
+  lineTotalPreview: string
+  sortOrder: number
+}
+
+/** The server's derived money summary for a PO (minor units, decimal strings). */
+export interface PurchaseOrderSummary {
+  subtotal: string
+  taxAmount: string
+  total: string
+}
+
+/**
+ * A purchase order with its lines. Header money (`subtotal/taxAmount/total`) is
+ * frozen at APPROVED (standard #7); before then `summary` previews it from the
+ * current lines. `summary`/`lineTotalPreview` are present on the detail read
+ * (getById) but not on list rows.
+ */
+export interface PurchaseOrder {
+  id: string
+  outletId: string
+  supplierId: string
+  poNumber: number
+  status: PurchaseOrderStatus
+  expectedDate: string | null
+  subtotal: string
+  taxAmount: string
+  total: string
+  taxRateBp: number
+  notes: string | null
+  cancelReason: string | null
+  approvedByUserId: string | null
+  approvedAt: string | null
+  createdAt: string
+  updatedAt: string
+  items: PurchaseOrderItem[]
+  summary?: PurchaseOrderSummary
+}

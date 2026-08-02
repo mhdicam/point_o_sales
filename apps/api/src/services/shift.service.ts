@@ -281,7 +281,10 @@ export class ShiftService {
   }
 
   private async load(client: Tx | BrewsyncClient, shiftId: string) {
-    const shift = await client.shift.findUnique({
+    // Narrow the Tx | BrewsyncClient union to one concrete client before the
+    // query: unioning two deeply-generic Prisma method signatures pushes TS past
+    // its instantiation-depth limit. Both members read identically.
+    const shift = await (client as BrewsyncClient).shift.findUnique({
       where: { id: shiftId },
       include: { movements: { orderBy: { createdAt: 'asc' } } },
     })

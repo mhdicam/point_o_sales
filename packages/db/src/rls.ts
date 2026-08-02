@@ -88,4 +88,9 @@ export const RLS_TABLES = [
   'stations',
   // Inventory & purchasing — S6
   'stock_movements',
+  'recipes',
+  'recipe_items',
+  'suppliers',
+  'purchase_orders',
+  'purchase_order_items',
 ] as const

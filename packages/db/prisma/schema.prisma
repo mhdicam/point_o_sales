@@ -81,6 +81,17 @@ model Tenant {
   // Inventory & purchasing — S6
   stockMovements StockMovement[]
 
+  // Recipe / BOM — S6-03
+  recipes     Recipe[]
+  recipeItems RecipeItem[]
+
+  // Purchasing — S6
+  suppliers Supplier[]
+
+  // Purchasing — S6-06
+  purchaseOrders     PurchaseOrder[]
+  purchaseOrderItems PurchaseOrderItem[]
+
   @@map("tenants")
 }
 
@@ -121,6 +132,7 @@ model Outlet {
 
   // Inventory & purchasing — S6
   stockMovements StockMovement[]
+  purchaseOrders PurchaseOrder[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -403,6 +415,7 @@ model Unit {
   derivedUnits Unit[]           @relation("UnitBase")
   sellVariants ProductVariant[] @relation("VariantSellUnit")
   stockVariants ProductVariant[] @relation("VariantStockUnit")
+  recipeItems  RecipeItem[]     @relation("RecipeItemUnit")
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -591,6 +604,14 @@ model ProductVariant {
   // Inventory & purchasing — S6. A variant is consumed (SALE_CONSUMPTION),
   // received (PURCHASE), and used as a recipe component in these roles.
   stockMovements StockMovement[]
+
+  // Recipe / BOM — S6-03. A variant optionally OWNS one recipe (the finished
+  // item it produces) and may appear as a COMPONENT in many others.
+  recipe          Recipe?      @relation("VariantRecipe")
+  recipeUsages    RecipeItem[] @relation("VariantRecipeComponent")
+
+  // Purchasing — S6-06. A variant is a line on many purchase orders.
+  purchaseOrderItems PurchaseOrderItem[]
 
   @@unique([tenantId, sku])
   // Barcode lookup is the retail scan path — must be unique per tenant to be
@@ -1335,4 +1356,203 @@ enum StockMovementType {
   TRANSFER
   ADJUSTMENT
   PRODUCTION
+}
+
+/// Design §3.4 — a recipe / BOM. Optional, one per ProductVariant (the finished
+/// item it produces). Gated by `features.recipe`: retail never touches this, a
+/// STOCKED item deducts itself directly with no BOM. Explosion to base
+/// ingredients is recursive via RecipeItem.componentType (see @brewsync/shared
+/// explodeRecipe).
+model Recipe {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  /// The finished variant this recipe produces. One recipe per variant.
+  variantId String @db.Uuid
+
+  /// How many finished base units one full run of this recipe yields, scaled
+  /// (UNIT_FACTOR_SCALE). Default one unit; a batch prep ("Simple Syrup") sets a
+  /// larger yield so its component quantities are per-batch, not per-unit.
+  yieldQtyScaled BigInt @default(1000000)
+
+  notes String?
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation("VariantRecipe", fields: [variantId], references: [id], onDelete: Cascade)
+  items   RecipeItem[]
+
+  /// One recipe per variant — the 1:1 in the ERD (ProductVariant ||--o| Recipe).
+  @@unique([variantId])
+  @@index([tenantId])
+  @@map("recipes")
+}
+
+/// Design §3.4 — one component line of a recipe. `componentType` INGREDIENT
+/// stops the explosion (a base item); PRODUCT recurses into that variant's own
+/// recipe, enabling sub-recipes / prep items. `qtyScaled` is in `recipeUnit`;
+/// the service normalises it to the component's stock base units before writing
+/// consumption movements.
+model RecipeItem {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  recipeId String @db.Uuid
+
+  /// The component consumed — an ingredient variant, or a sub-product variant.
+  componentVariantId String            @db.Uuid
+  componentType      RecipeComponentType
+
+  /// Quantity of the component per recipe yield, expressed in `recipeUnit`,
+  /// scaled (UNIT_FACTOR_SCALE). Kept in the recipe's own unit so editing the
+  /// component's stock unit never silently changes the recipe.
+  qtyScaled    BigInt
+  recipeUnitId String @db.Uuid
+
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant           Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  recipe           Recipe         @relation(fields: [recipeId], references: [id], onDelete: Cascade)
+  componentVariant ProductVariant @relation("VariantRecipeComponent", fields: [componentVariantId], references: [id], onDelete: Restrict)
+  recipeUnit       Unit           @relation("RecipeItemUnit", fields: [recipeUnitId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([recipeId])
+  @@index([componentVariantId])
+  @@map("recipe_items")
+}
+
+/// Design §3.4 — whether a recipe component is a base ingredient (stop) or a
+/// sub-product (recurse into its recipe).
+enum RecipeComponentType {
+  INGREDIENT
+  PRODUCT
+}
+
+// ---------------------------------------------------------------------------
+// Supplier — S6-05 (design §4.4)
+// ---------------------------------------------------------------------------
+
+/// Design §4.4 — a vendor, tenant-level master data shared across every outlet
+/// (a supplier is registered once, not per branch). Carries the fields the
+/// purchasing flow and, later, Accounting need: `paymentTermDays` drives the
+/// payable due date, `taxId` (NPWP) the input-tax invoice. Per-item buy prices
+/// live on PO lines, not here — they change every transaction (§4.4).
+model Supplier {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  /// Internal lookup code, unique per tenant.
+  code String
+  name String
+
+  contactName String?
+  phone       String?
+  email       String?
+  address     String?
+  /// NPWP — for the input-tax (faktur pajak masukan) invoice.
+  taxId       String?
+
+  /// Payment term in days: 0 = cash, 30 = net-30. Accounting derives the due date.
+  paymentTermDays Int    @default(0)
+  defaultCurrency String @default("IDR")
+
+  isActive Boolean @default(true)
+  notes    String?
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  createdByUserId String?  @db.Uuid
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  // purchaseOrders back-relation added in S6-06 when PurchaseOrder lands.
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("suppliers")
+}
+
+/// Design §4.5 — the PO lifecycle. DRAFT is the only editable state; APPROVED is
+/// the snapshot moment (standard #7). RECEIVING/RECEIVED/CLOSED are driven by the
+/// goods-receipt path (S6-07). CANCELLED is terminal and unreachable once goods
+/// start arriving. Mirrored by `purchaseOrderStateMachine` in the API.
+enum PurchaseOrderStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  RECEIVING
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+/// Design §4.5 — a purchase order: intent to buy from a supplier. The PO never
+/// touches stock; only a goods receipt (S6-07) writes a StockMovement. Money is
+/// integer minor units (standard #2); the header totals freeze at APPROVED
+/// (standard #7) and are never re-derived from master data after.
+model PurchaseOrder {
+  id         String              @id @default(uuid()) @db.Uuid
+  tenantId   String              @db.Uuid
+  outletId   String              @db.Uuid
+  supplierId String              @db.Uuid
+  /// Human-facing per-tenant number, assigned at create (MAX+1). Unique per tenant.
+  poNumber   Int
+  status     PurchaseOrderStatus @default(DRAFT)
+
+  expectedDate DateTime?
+
+  /// Snapshotted at APPROVED. Minor units; taxRateBp is basis points (1100 = 11%).
+  subtotal  BigInt @default(0)
+  taxAmount BigInt @default(0)
+  total     BigInt @default(0)
+  taxRateBp Int    @default(0)
+
+  notes        String?
+  cancelReason String?
+
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  createdByUserId  String?   @db.Uuid
+  approvedByUserId String?   @db.Uuid
+  approvedAt       DateTime?
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet   Outlet   @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  items    PurchaseOrderItem[]
+
+  @@unique([tenantId, poNumber])
+  @@index([tenantId])
+  @@index([outletId])
+  @@index([supplierId])
+  @@map("purchase_orders")
+}
+
+/// Design §4.5 — a PO line. qty is scaled base units (UNIT_FACTOR_SCALE), unitCost
+/// and lineTotal are minor units. unitCost/lineTotal freeze at APPROVED; qtyReceived
+/// accumulates as goods arrive (S6-07) — stock itself only ever moves via StockMovement.
+model PurchaseOrderItem {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  poId      String @db.Uuid
+  variantId String @db.Uuid
+
+  qtyOrderedScaled  BigInt
+  qtyReceivedScaled BigInt @default(0)
+  unitCost          BigInt @default(0)
+  lineTotal         BigInt @default(0)
+  sortOrder         Int    @default(0)
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  po      PurchaseOrder  @relation(fields: [poId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([poId])
+  @@index([variantId])
+  @@map("purchase_order_items")
 }

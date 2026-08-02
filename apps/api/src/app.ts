@@ -37,6 +37,10 @@ import { createShiftRouter } from './routes/shift.routes.js'
 import { createSalesMethodRouter } from './routes/sales-method.routes.js'
 import { createFloorPlanRouter } from './routes/floor-plan.routes.js'
 import { createKdsRouter } from './routes/kds.routes.js'
+import { createStockRouter } from './routes/stock.routes.js'
+import { createRecipeRouter } from './routes/recipe.routes.js'
+import { createSupplierRouter } from './routes/supplier.routes.js'
+import { createPurchaseOrderRouter } from './routes/purchase-order.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
 export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
@@ -125,6 +129,14 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   app.use('/floor-plan', createFloorPlanRouter(db))
   // S7-04 — stations + KDS board (gated on the `kds` feature).
   app.use('/', createKdsRouter(db))
+  // S6-01 — stock ledger: on-hand, inventory-card history, stock-take adjust.
+  app.use('/inventory', createStockRouter(db))
+  // S6-03 — recipe / BOM per variant (gated on the `recipe` feature).
+  app.use('/variants', createRecipeRouter(db))
+  // S6-05 — supplier master (gated on the `purchasing` feature).
+  app.use('/suppliers', createSupplierRouter(db))
+  // S6-06 — purchase orders + state machine (gated on the `purchasing` feature).
+  app.use('/purchase-orders', createPurchaseOrderRouter(db))
 
   // S2-04/S2-07 — reference wiring for the two guards. Real feature routes
   // replace this in S3+.

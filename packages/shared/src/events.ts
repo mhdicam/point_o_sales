@@ -23,6 +23,10 @@ export const EVENT_TYPES = {
   // Inventory
   STOCK_ADJUSTED: 'StockAdjusted',
   GOODS_RECEIVED: 'GoodsReceived',
+  /** A PO reaches APPROVED (§4.5) — price/qty frozen, sent to the supplier. */
+  PURCHASE_ORDER_APPROVED: 'PurchaseOrderApproved',
+  /** Moving-average COGS for a sale (§4.3) — Accounting posts cost of goods sold. */
+  COGS_RECORDED: 'CogsRecorded',
 
   // Cash / shift
   SHIFT_OPENED: 'ShiftOpened',

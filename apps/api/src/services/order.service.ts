@@ -56,6 +56,7 @@ import { tableStateMachine, type TableStatus } from './table.state.js'
 import { classifyMergeCharges } from './table-ops.policy.js'
 import { routeLine } from './kds-routing.policy.js'
 import { FeatureService } from './feature.service.js'
+import { StockDeductionService } from './stock-deduction.service.js'
 import {
   runBillPipeline,
   type DiscountInput,
@@ -279,6 +280,22 @@ export class OrderService {
         where: { id: orderId },
         data: { status: 'SENT', sentAt: new Date() },
       })
+
+      // Stock deduction at SENT (§4.2) — a no-op unless the outlet deducts at
+      // SENT. Idempotent on ('order', orderId), so a redelivered send is safe.
+      await new StockDeductionService(tx as unknown as BrewsyncClient).deductForOrder(
+        tx,
+        {
+          id: orderId,
+          outletId: order.outletId,
+          items: await tx.orderItem.findMany({
+            where: { orderId },
+            select: { variantId: true, qty: true },
+          }),
+        },
+        'SENT',
+        ctx.userId ?? null
+      )
 
       // Tell the kitchen board new tickets landed (S7-05) — only when something
       // actually routed, so a pure-STOCKED order does not wake idle screens.
@@ -652,7 +669,7 @@ export class OrderService {
 
   /** Reads one order with its lines and charge breakdown. */
   async getById(orderId: string) {
-    const order = await this.load(this.db, orderId)
+    const order = await this.load(this.db as unknown as Tx, orderId)
     if (!order) throw notFound('ORDER_NOT_FOUND', `Order ${orderId} not found.`)
     return order
   }
@@ -730,7 +747,7 @@ export class OrderService {
    * gratuity are reconstructed from their durable `OrderCharge` rows.
    */
   private async gatherPipeline(
-    client: Tx | BrewsyncClient,
+    client: Tx,
     orderId: string
   ): Promise<{
     pipelineInput: PipelineInput
@@ -919,7 +936,7 @@ export class OrderService {
    * a BigInt, so the money never becomes a float and the wire carries decimal
    * strings (standard #2). The FE renders these rows; it does no money math.
    */
-  private async load(client: Tx | BrewsyncClient, orderId: string) {
+  private async load(client: Tx, orderId: string) {
     const order = await client.order.findUnique({
       where: { id: orderId },
       include: {
@@ -960,7 +977,7 @@ export class OrderService {
    * `gatherPipeline` with `recompute`, so the numbers a client sees are computed
    * by exactly the same code that persists the charges: they cannot drift.
    */
-  private async computeSummary(client: Tx | BrewsyncClient, orderId: string) {
+  private async computeSummary(client: Tx, orderId: string) {
     const gathered = await this.gatherPipeline(client, orderId)
     const result = runBillPipeline(gathered.pipelineInput)
     return {

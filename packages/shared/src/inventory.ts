@@ -97,11 +97,11 @@ export function valuate(lots: readonly StockLot[]): StockValuation {
     if (lot.qty > 0n) {
       const cost = lot.costPerUnit ?? avgCostOf(onHand, value)
       onHand += lot.qty
-      value += mulDivScale(lot.qty, cost)
+      value += extendedCost(lot.qty, cost)
     } else if (lot.qty < 0n) {
       const avg = avgCostOf(onHand, value)
       onHand += lot.qty // qty is negative
-      value += mulDivScale(lot.qty, avg) // reduces value at the average
+      value += extendedCost(lot.qty, avg) // reduces value at the average
     }
     // qty === 0n: a no-op row, ignored.
   }
@@ -125,8 +125,14 @@ export function avgCostOf(onHand: bigint, value: bigint): bigint {
   return remainder * 2n >= onHand ? quotient + 1n : quotient
 }
 
-/** qty(scaled base) * costPerBaseUnit / SCALE → minor units, rounded half-up. */
-function mulDivScale(qtyScaledBase: bigint, costPerUnit: bigint): bigint {
+/**
+ * Extended cost of a movement: `qty(scaled base) * costPerBaseUnit / SCALE` in
+ * minor units, rounded half away from zero. A signed input yields a signed
+ * result, so an outbound (negative qty) SALE_CONSUMPTION row negated gives the
+ * positive COGS it contributes (§4.3). This is the same fold the valuation uses,
+ * exported so the sale path totals COGS from the exact costs it snapshotted.
+ */
+export function extendedCost(qtyScaledBase: bigint, costPerUnit: bigint): bigint {
   const numerator = qtyScaledBase * costPerUnit
   const quotient = numerator / UNIT_FACTOR_SCALE
   const remainder = numerator % UNIT_FACTOR_SCALE
