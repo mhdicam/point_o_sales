@@ -9,6 +9,7 @@ import { EVENT_TYPES } from '@brewsync/shared'
 import { loadConfig } from './config.js'
 import { createLogger } from './logger.js'
 import { createApp } from './app.js'
+import { createSystemClient } from './system-client.js'
 import { startOutboxWorker } from './services/outbox.service.js'
 import { KdsHub } from './realtime/kds.hub.js'
 
@@ -18,8 +19,12 @@ const db = createPrismaClient({
   datasourceUrl: config.DATABASE_URL,
   log: config.isProduction ? [] : ['error', 'warn'],
 })
+// The one BYPASSRLS client: powers the pre-tenant / cross-tenant reads (public
+// landing + QR resolve, outbox sweep, login membership list). Everything else
+// stays on the RLS-subject `db`.
+const system = createSystemClient(config)
 
-const app = createApp(db, config, logger)
+const app = createApp(db, config, logger, system)
 
 const port = config.PORT
 
@@ -37,7 +42,7 @@ const KDS_EVENTS = new Set<string>([EVENT_TYPES.ORDER_SENT, EVENT_TYPES.KDS_ITEM
 
 // S1-06 — outbox worker (cross-tenant background poller). Fans KDS events to the
 // hub as they dispatch (S7-05).
-const outboxWorker = startOutboxWorker(db, logger, config, (event) => {
+const outboxWorker = startOutboxWorker(db, system, logger, config, (event) => {
   if (KDS_EVENTS.has(event.type)) {
     kdsHub.broadcast(event.outletId, { type: event.type, payload: event.payload })
   }

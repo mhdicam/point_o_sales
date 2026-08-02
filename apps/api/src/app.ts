@@ -14,6 +14,7 @@ import pinoHttp from 'pino-http'
 import type { Logger } from 'pino'
 import type { BrewsyncClient } from '@brewsync/db'
 import type { Config } from './config.js'
+import type { SystemClient } from './system-client.js'
 import { createAuthRouter, errorHandler } from './routes/auth.routes.js'
 import { createHealthRouter } from './routes/health.routes.js'
 import { createPinRouter } from './routes/pin.routes.js'
@@ -46,7 +47,12 @@ import { createQrRouter } from './routes/qr.routes.js'
 import { createPublicLandingRouter } from './routes/public-landing.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
-export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
+export function createApp(
+  db: BrewsyncClient,
+  config: Config,
+  logger: Logger,
+  system: SystemClient
+): Express {
   const app = express()
 
   // Structured request logging — every line carries requestId.
@@ -97,7 +103,7 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // context from the resolved token (never client input) — the safest of the
   // pre-tenant routes. It carries its own per-IP rate limiter; `/pin` and future
   // `/online` ordering should adopt the same `createRateLimit` factory.
-  app.use(createQrRouter(db))
+  app.use(createQrRouter(db, system))
 
   // S9-03 — public landing page (`/p/:slug`). Pre-tenant by necessity: a customer
   // opening a public catalog holds no token. The router self-binds tenant/outlet
@@ -105,7 +111,7 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // `landingPage` feature inside the service, and carries its own per-IP limiter.
   // The authenticated `/landing` CMS surface (S9-02) mounts after the tenant
   // middleware below.
-  app.use(createPublicLandingRouter(db))
+  app.use(createPublicLandingRouter(db, system))
 
   // ---- Everything below requires a valid access token. ----
 
@@ -115,7 +121,7 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // S2-09 — tenant selection. Mounted here (token required) but deliberately
   // NOT behind requireTenant: an email/password session holds no tenant yet,
   // and this is the route that gives it one.
-  app.use('/session', createSessionRouter(db, config))
+  app.use('/session', createSessionRouter(db, config, system))
 
   // S2-03/S2-05 — effective permissions, consumed by the FE usePermission hook.
   app.use('/me', createMeRouter(db))

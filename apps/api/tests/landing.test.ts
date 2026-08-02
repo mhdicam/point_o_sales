@@ -29,7 +29,7 @@ import { dirname, resolve as resolvePath } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { config as loadEnv } from 'dotenv'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
-import { createPrismaClient, runUnscoped } from '@brewsync/db'
+import { createPrismaClient, createSystemPrismaClient } from '@brewsync/db'
 import { PublicLandingService } from '../src/services/public-landing.service.js'
 
 loadEnv({ path: resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
@@ -47,7 +47,10 @@ const LANDING_FEATURES = { landingPage: true }
 describe('S9-03 — public landing page read', () => {
   const dbApp = createPrismaClient({ datasourceUrl: APP_ROLE_URL })
   const dbOwner = createPrismaClient({ datasourceUrl: OWNER_ROLE_URL })
-  const landing = new PublicLandingService(dbApp)
+  // The system client backs resolveSlug's pre-tenant read (BYPASSRLS); the app
+  // client stays RLS-subject for the bound buildPage reads.
+  const dbSystem = createSystemPrismaClient({ datasourceUrl: process.env.TEST_UNSCOPED_DATABASE_URL ?? '' })
+  const landing = new PublicLandingService(dbApp, dbSystem)
 
   const runId = randomUUID().slice(0, 8)
   let tenantA: string
@@ -59,130 +62,148 @@ describe('S9-03 — public landing page read', () => {
   let slugDraft: string
   let variantA: string
 
+  /**
+   * Binds the owner session's `app.current_tenant` GUC so the writes that follow
+   * pass FORCE RLS `WITH CHECK`. The owner client is pinned to one connection
+   * (connection_limit=1 in the URL), so this session-level set_config persists
+   * across the subsequent raw calls on that client. This is the sanctioned
+   * fixture pattern (tenant-isolation.test.ts) — `runUnscoped` does NOT bind the
+   * GUC, so raw owner writes need it set explicitly.
+   */
+  async function bindOwnerTenant(tenantId: string): Promise<void> {
+    await dbOwner.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, false)`, tenantId)
+  }
+
   /** Sets the tenant's feature flags (owner). */
   async function setFeatures(tenantId: string, features: Record<string, boolean>): Promise<void> {
-    await runUnscoped(
-      () => dbOwner.$executeRaw`
-        UPDATE business_profiles SET features = ${JSON.stringify(features)}::jsonb, "updatedAt" = now()
-        WHERE "tenantId" = ${tenantId}::uuid
-      `
-    )
+    await bindOwnerTenant(tenantId)
+    await dbOwner.$executeRaw`
+      UPDATE business_profiles SET features = ${JSON.stringify(features)}::jsonb, "updatedAt" = now()
+      WHERE "tenantId" = ${tenantId}::uuid
+    `
   }
 
   /** Flips a page's status (owner) — unpublish for the opacity test. */
-  async function setPageStatus(pageSlug: string, status: 'DRAFT' | 'PUBLISHED'): Promise<void> {
-    await runUnscoped(
-      () => dbOwner.$executeRaw`
-        UPDATE landing_pages SET status = ${status}, "publishedAt" = CASE WHEN ${status} = 'PUBLISHED' THEN now() ELSE NULL END
-        WHERE slug = ${pageSlug}
-      `
-    )
+  async function setPageStatus(
+    tenantId: string,
+    pageSlug: string,
+    status: 'DRAFT' | 'PUBLISHED'
+  ): Promise<void> {
+    await bindOwnerTenant(tenantId)
+    // `status` is a LandingPageStatus enum column — cast the parameter explicitly.
+    await dbOwner.$executeRaw`
+      UPDATE landing_pages SET status = ${status}::"LandingPageStatus", "publishedAt" = CASE WHEN ${status} = 'PUBLISHED' THEN now() ELSE NULL END
+      WHERE slug = ${pageSlug}
+    `
   }
 
   beforeAll(async () => {
-    await runUnscoped(async () => {
-      // ---- Tenant A with a PUBLISHED page + a draft + a catalog + an inactive product.
-      const [tenant] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
-        VALUES (gen_random_uuid(), ${`lp-a-${runId}`}, 'Landing A', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
-        RETURNING id
-      `
-      tenantA = tenant!.id
-      await dbOwner.$executeRaw`
-        INSERT INTO business_profiles (id, "tenantId", preset, features, "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantA}::uuid, 'FNB', ${JSON.stringify(LANDING_FEATURES)}::jsonb, now())
-      `
-      const [outlet] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO outlets (id, "tenantId", code, name, status, "taxRateBp", "roundingIncrement", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantA}::uuid, 'OUTA', 'Outlet A', 'ACTIVE', 0, 0, now())
-        RETURNING id
-      `
-      outletA = outlet!.id
+    // ---- Tenant A with a PUBLISHED page + a draft + a catalog + an inactive product.
+    // `tenants` is a global (non-RLS) table, so it inserts with no GUC bound.
+    const [tenant] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
+      VALUES (gen_random_uuid(), ${`lp-a-${runId}`}, 'Landing A', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
+      RETURNING id
+    `
+    tenantA = tenant!.id
+    // Bind A's tenant so every tenant-scoped INSERT below passes FORCE RLS.
+    await bindOwnerTenant(tenantA)
+    await dbOwner.$executeRaw`
+      INSERT INTO business_profiles (id, "tenantId", preset, features, "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantA}::uuid, 'FNB', ${JSON.stringify(LANDING_FEATURES)}::jsonb, now())
+    `
+    const [outlet] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO outlets (id, "tenantId", code, name, status, "taxRateBp", "roundingIncrement", "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantA}::uuid, 'OUTA', 'Outlet A', 'ACTIVE', 0, 0, now())
+      RETURNING id
+    `
+    outletA = outlet!.id
 
-      const [prod] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO products (id, "tenantId", name, slug, "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantA}::uuid, 'Kopi A', ${`a-prod-${runId}`}, now())
-        RETURNING id
-      `
-      const [variant] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO product_variants (id, "tenantId", "productId", sku, name, "basePrice", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantA}::uuid, ${prod!.id}::uuid, ${`SKU-A-${runId}`}, 'Kopi A', 15000, now())
-        RETURNING id
-      `
-      variantA = variant!.id
+    const [prod] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO products (id, "tenantId", name, slug, "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantA}::uuid, 'Kopi A', ${`a-prod-${runId}`}, now())
+      RETURNING id
+    `
+    const [variant] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO product_variants (id, "tenantId", "productId", sku, name, "basePrice", "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantA}::uuid, ${prod!.id}::uuid, ${`SKU-A-${runId}`}, 'Kopi A', 15000, now())
+      RETURNING id
+    `
+    variantA = variant!.id
 
-      // A deactivated product must silently drop from the catalog.
-      await dbOwner.$executeRaw`
-        INSERT INTO products (id, "tenantId", name, slug, "isActive", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantA}::uuid, 'Hidden A', ${`a-hidden-${runId}`}, false, now())
-      `
+    // A deactivated product must silently drop from the catalog.
+    await dbOwner.$executeRaw`
+      INSERT INTO products (id, "tenantId", name, slug, "isActive", "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantA}::uuid, 'Hidden A', ${`a-hidden-${runId}`}, false, now())
+    `
 
-      slugA = `landing-a-${runId}`
-      slugDraft = `landing-draft-${runId}`
-      await dbOwner.$queryRaw`
-        INSERT INTO landing_pages (id, "tenantId", "outletId", slug, title, description, theme, "orderingEnabled", status, "publishedAt", "updatedAt")
-        VALUES
-          (gen_random_uuid(), ${tenantA}::uuid, ${outletA}::uuid, ${slugA}, 'Outlet A Landing', 'Best kopi in town', ${JSON.stringify({ brand: '#123456' })}::jsonb, false, 'PUBLISHED', now(), now()),
-          (gen_random_uuid(), ${tenantA}::uuid, ${outletA}::uuid, ${slugDraft}, 'Draft Page', NULL, NULL, false, 'DRAFT', NULL, now())
-      `
-      await dbOwner.$executeRaw`
-        INSERT INTO landing_sections (id, "tenantId", "landingPageId", type, position, title, content)
-        SELECT gen_random_uuid(), ${tenantA}::uuid, lp.id, 'CATALOG', 0, 'Menu', '{}'::jsonb
-        FROM landing_pages lp WHERE lp."tenantId" = ${tenantA}::uuid AND lp.slug = ${slugA}
-      `
-      await dbOwner.$executeRaw`
-        INSERT INTO landing_sections (id, "tenantId", "landingPageId", type, position, title, content)
-        SELECT gen_random_uuid(), ${tenantA}::uuid, lp.id, 'HOURS', 1, 'Hours', ${JSON.stringify({ hours: '09:00-22:00' })}::jsonb
-        FROM landing_pages lp WHERE lp."tenantId" = ${tenantA}::uuid AND lp.slug = ${slugA}
-      `
+    slugA = `landing-a-${runId}`
+    slugDraft = `landing-draft-${runId}`
+    await dbOwner.$queryRaw`
+      INSERT INTO landing_pages (id, "tenantId", "outletId", slug, title, description, theme, "orderingEnabled", status, "publishedAt", "updatedAt")
+      VALUES
+        (gen_random_uuid(), ${tenantA}::uuid, ${outletA}::uuid, ${slugA}, 'Outlet A Landing', 'Best kopi in town', ${JSON.stringify({ brand: '#123456' })}::jsonb, false, 'PUBLISHED', now(), now()),
+        (gen_random_uuid(), ${tenantA}::uuid, ${outletA}::uuid, ${slugDraft}, 'Draft Page', NULL, NULL, false, 'DRAFT', NULL, now())
+    `
+    await dbOwner.$executeRaw`
+      INSERT INTO landing_sections (id, "tenantId", "landingPageId", type, position, title, content)
+      SELECT gen_random_uuid(), ${tenantA}::uuid, lp.id, 'CATALOG', 0, 'Menu', '{}'::jsonb
+      FROM landing_pages lp WHERE lp."tenantId" = ${tenantA}::uuid AND lp.slug = ${slugA}
+    `
+    await dbOwner.$executeRaw`
+      INSERT INTO landing_sections (id, "tenantId", "landingPageId", type, position, title, content)
+      SELECT gen_random_uuid(), ${tenantA}::uuid, lp.id, 'HOURS', 1, 'Hours', ${JSON.stringify({ hours: '09:00-22:00' })}::jsonb
+      FROM landing_pages lp WHERE lp."tenantId" = ${tenantA}::uuid AND lp.slug = ${slugA}
+    `
 
-      // ---- Tenant B with its OWN published page + product, to prove isolation.
-      const [tenantBRow] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
-        VALUES (gen_random_uuid(), ${`lp-b-${runId}`}, 'Landing B', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
-        RETURNING id
-      `
-      tenantB = tenantBRow!.id
-      await dbOwner.$executeRaw`
-        INSERT INTO business_profiles (id, "tenantId", preset, features, "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantB}::uuid, 'FNB', ${JSON.stringify(LANDING_FEATURES)}::jsonb, now())
-      `
-      const [outletBRow] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO outlets (id, "tenantId", code, name, status, "taxRateBp", "roundingIncrement", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantB}::uuid, 'OUTB', 'Outlet B', 'ACTIVE', 0, 0, now())
-        RETURNING id
-      `
-      outletB = outletBRow!.id
-      const [prodB] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO products (id, "tenantId", name, slug, "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantB}::uuid, 'Kopi B', ${`b-prod-${runId}`}, now())
-        RETURNING id
-      `
-      // Kopi B's variant makes it purchasable so it appears in the catalog.
-      await dbOwner.$executeRaw`
-        INSERT INTO product_variants (id, "tenantId", "productId", sku, name, "basePrice", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantB}::uuid, ${prodB!.id}::uuid, ${`SKU-B-${runId}`}, 'Kopi B', 20000, now())
-      `
+    // ---- Tenant B with its OWN published page + product, to prove isolation.
+    const [tenantBRow] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
+      VALUES (gen_random_uuid(), ${`lp-b-${runId}`}, 'Landing B', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
+      RETURNING id
+    `
+    tenantB = tenantBRow!.id
+    // Rebind to B for its tenant-scoped inserts.
+    await bindOwnerTenant(tenantB)
+    await dbOwner.$executeRaw`
+      INSERT INTO business_profiles (id, "tenantId", preset, features, "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantB}::uuid, 'FNB', ${JSON.stringify(LANDING_FEATURES)}::jsonb, now())
+    `
+    const [outletBRow] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO outlets (id, "tenantId", code, name, status, "taxRateBp", "roundingIncrement", "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantB}::uuid, 'OUTB', 'Outlet B', 'ACTIVE', 0, 0, now())
+      RETURNING id
+    `
+    outletB = outletBRow!.id
+    const [prodB] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO products (id, "tenantId", name, slug, "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantB}::uuid, 'Kopi B', ${`b-prod-${runId}`}, now())
+      RETURNING id
+    `
+    // Kopi B's variant makes it purchasable so it appears in the catalog.
+    await dbOwner.$executeRaw`
+      INSERT INTO product_variants (id, "tenantId", "productId", sku, name, "basePrice", "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantB}::uuid, ${prodB!.id}::uuid, ${`SKU-B-${runId}`}, 'Kopi B', 20000, now())
+    `
 
-      slugB = `landing-b-${runId}`
-      await dbOwner.$queryRaw`
-        INSERT INTO landing_pages (id, "tenantId", "outletId", slug, title, description, theme, "orderingEnabled", status, "publishedAt", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantB}::uuid, ${outletB}::uuid, ${slugB}, 'Outlet B Landing', NULL, NULL, false, 'PUBLISHED', now(), now())
-      `
-      await dbOwner.$executeRaw`
-        INSERT INTO landing_sections (id, "tenantId", "landingPageId", type, position, title, content)
-        SELECT gen_random_uuid(), ${tenantB}::uuid, lp.id, 'CATALOG', 0, 'Menu', '{}'::jsonb
-        FROM landing_pages lp WHERE lp."tenantId" = ${tenantB}::uuid AND lp.slug = ${slugB}
-      `
-    })
+    slugB = `landing-b-${runId}`
+    await dbOwner.$queryRaw`
+      INSERT INTO landing_pages (id, "tenantId", "outletId", slug, title, description, theme, "orderingEnabled", status, "publishedAt", "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantB}::uuid, ${outletB}::uuid, ${slugB}, 'Outlet B Landing', NULL, NULL, false, 'PUBLISHED', now(), now())
+    `
+    await dbOwner.$executeRaw`
+      INSERT INTO landing_sections (id, "tenantId", "landingPageId", type, position, title, content)
+      SELECT gen_random_uuid(), ${tenantB}::uuid, lp.id, 'CATALOG', 0, 'Menu', '{}'::jsonb
+      FROM landing_pages lp WHERE lp."tenantId" = ${tenantB}::uuid AND lp.slug = ${slugB}
+    `
   })
 
   afterAll(async () => {
-    await runUnscoped(() =>
-      dbOwner.$executeRaw`DELETE FROM tenants WHERE id IN (${tenantA}::uuid, ${tenantB}::uuid)`
-    )
+    // `tenants` is global (no RLS); the cascade removes the tenant-scoped rows.
+    await dbOwner.$executeRaw`DELETE FROM tenants WHERE id IN (${tenantA}::uuid, ${tenantB}::uuid)`
     await dbApp.$disconnect()
     await dbOwner.$disconnect()
+    await dbSystem.$disconnect()
   })
 
   it('resolves each tenant slug to its own tenant and rejects a garbage slug opaquely', async () => {
@@ -208,12 +229,12 @@ describe('S9-03 — public landing page read', () => {
   })
 
   it('unpublishing a live page 404s it', async () => {
-    await setPageStatus(slugA, 'DRAFT')
+    await setPageStatus(tenantA, slugA, 'DRAFT')
     await expect(landing.resolveSlug(slugA)).rejects.toMatchObject({
       status: 404,
       code: 'LANDING_INVALID',
     })
-    await setPageStatus(slugA, 'PUBLISHED')
+    await setPageStatus(tenantA, slugA, 'PUBLISHED')
     await expect(landing.resolveSlug(slugA)).resolves.toMatchObject({ tenantId: tenantA })
   })
 

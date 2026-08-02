@@ -21,18 +21,31 @@ import { config as loadEnv } from 'dotenv'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import supertest from 'supertest'
 import { createApp } from '../src/app.js'
-import { runUnscoped, createPrismaClient } from '@brewsync/db'
+import { createPrismaClient, createSystemPrismaClient } from '@brewsync/db'
 import { loadConfig } from '../src/config.js'
 import { createLogger } from '../src/logger.js'
 import { TokenService } from '../src/services/token.service.js'
 
 loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
 
+/** Pin the owner client to one connection so a session-level GUC persists. */
+function withConnectionLimitOne(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}connection_limit=1`
+}
+
 describe('Session scope selection', () => {
   const config = loadConfig()
   const logger = createLogger(config)
-  const dbOwner = createPrismaClient({ datasourceUrl: process.env.TEST_DIRECT_DATABASE_URL ?? '' })
-  const app = createApp(dbOwner, config, logger)
+  // Owner is FORCE-RLS-subject; pin it so the fixture set_config below sticks
+  // across the raw inserts on RLS tables (outlets, tenant_memberships).
+  const dbOwner = createPrismaClient({
+    datasourceUrl: withConnectionLimitOne(process.env.TEST_DIRECT_DATABASE_URL ?? ''),
+  })
+  // The BYPASSRLS system client backs the session service's cross-tenant
+  // membership read — the whole point of S2-09 is to read across tenants before
+  // one is selected.
+  const dbSystem = createSystemPrismaClient({ datasourceUrl: process.env.TEST_UNSCOPED_DATABASE_URL ?? '' })
+  const app = createApp(dbOwner, config, logger, dbSystem)
   const request = supertest(app)
 
   const runId = randomUUID().slice(0, 8)
@@ -51,21 +64,18 @@ describe('Session scope selection', () => {
   const bindTenant = async (tenantId: string): Promise<void> => {
     // RLS is FORCEd, so the owner role is subject to it too, and the binding is
     // per-session: it has to be re-issued before each tenant's inserts or the
-    // second tenant's rows fail the WITH CHECK clause with 42501.
-    await runUnscoped(async () => {
-      await dbOwner.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, false)`, tenantId)
-    })
+    // second tenant's rows fail the WITH CHECK clause with 42501. The owner
+    // client is pinned to one connection (connection_limit=1), so this session
+    // setting persists across the raw inserts below.
+    await dbOwner.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, false)`, tenantId)
   }
 
   const insertTenant = async (slug: string, name: string): Promise<string> => {
-    const rows = await runUnscoped(
-      async () =>
-        await dbOwner.$queryRaw<Array<{ id: string }>>`
-          INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
-          VALUES (gen_random_uuid(), ${slug}, ${name}, 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
-          RETURNING id
-        `
-    )
+    const rows = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
+      VALUES (gen_random_uuid(), ${slug}, ${name}, 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
+      RETURNING id
+    `
     return rows[0]!.id
   }
 
@@ -87,14 +97,11 @@ describe('Session scope selection', () => {
     await bindTenant(strangerTenantId)
     strangerOutletId = await insertOutlet(strangerTenantId, 'MAIN', 'Stranger Outlet')
 
-    const userRows = await runUnscoped(
-      async () =>
-        await dbOwner.$queryRaw<Array<{ id: string }>>`
-          INSERT INTO users (id, email, "fullName", status, "passwordHash", "updatedAt")
-          VALUES (gen_random_uuid(), ${userEmail}, 'Session Test User', 'ACTIVE', 'unused', now())
-          RETURNING id
-        `
-    )
+    const userRows = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO users (id, email, "fullName", status, "passwordHash", "updatedAt")
+      VALUES (gen_random_uuid(), ${userEmail}, 'Session Test User', 'ACTIVE', 'unused', now())
+      RETURNING id
+    `
     userId = userRows[0]!.id
 
     // Membership in the member tenant only. The stranger tenant exists and is
@@ -107,16 +114,15 @@ describe('Session scope selection', () => {
     `
 
     const tokenService = new TokenService(config, dbOwner)
-    tenantlessToken = (await runUnscoped(() => tokenService.issue({ sub: userId }))).accessToken
+    tenantlessToken = (await tokenService.issue({ sub: userId })).accessToken
   })
 
   afterAll(async () => {
-    await runUnscoped(async () => {
-      await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${memberTenantId}::uuid`
-      await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${strangerTenantId}::uuid`
-      await dbOwner.$executeRaw`DELETE FROM users WHERE email = ${userEmail}`
-    })
+    await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${memberTenantId}::uuid`
+    await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${strangerTenantId}::uuid`
+    await dbOwner.$executeRaw`DELETE FROM users WHERE email = ${userEmail}`
     await dbOwner.$disconnect()
+    await dbSystem.$disconnect()
   })
 
   it('rejects an anonymous caller', async () => {

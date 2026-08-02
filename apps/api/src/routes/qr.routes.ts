@@ -20,6 +20,7 @@ import type { BrewsyncClient } from '@brewsync/db'
 import { QrOrderService } from '../services/qr-order.service.js'
 import { createRateLimit } from '../middleware/rate-limit.js'
 import { badRequest, notFound } from '../http-error.js'
+import type { SystemClient } from '../system-client.js'
 
 const placeOrderSchema = z.object({
   items: z
@@ -41,9 +42,9 @@ function readToken(raw: unknown): string {
   return raw
 }
 
-export function createQrRouter(db: BrewsyncClient): Router {
+export function createQrRouter(db: BrewsyncClient, system: SystemClient): Router {
   const router = Router()
-  const qr = new QrOrderService(db)
+  const qr = new QrOrderService(db, system)
 
   // Public-endpoint throttles: a generous read cap, a tighter write cap.
   const readLimit = createRateLimit({ windowMs: 60_000, max: 60, code: 'QR_RATE_LIMITED' })

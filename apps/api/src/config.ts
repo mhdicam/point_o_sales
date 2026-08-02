@@ -22,6 +22,11 @@ const schema = z.object({
 
   DATABASE_URL: z.string().url(),
   DIRECT_DATABASE_URL: z.string().url().optional(),
+  // Connection string for the `brewsync_system` (BYPASSRLS) role. Powers the
+  // genuine cross-tenant / pre-tenant reads (public landing + QR resolve, outbox
+  // sweep, login membership list). Required: a system without it cannot serve
+  // those reads, so fail at boot rather than return zero rows in production.
+  UNSCOPED_DATABASE_URL: z.string().url(),
 
   // No defaults: a fallback secret that works in dev silently ships to prod.
   JWT_ACCESS_SECRET: z.string().min(32, 'must be at least 32 characters'),

@@ -37,10 +37,30 @@ export function createPrismaClient(options: PrismaClientOptions = {}) {
 }
 
 /**
- * Raw, unextended client. For migrations, seeds, and the outbox worker's
- * cross-tenant sweep. Named to make its use obvious in review.
+ * Raw, unextended client. For migrations, seeds, and test harnesses. Named to
+ * make its use obvious in review.
  */
 export function createUnscopedPrismaClient(options: PrismaClientOptions = {}) {
+  return new PrismaClient({
+    ...(options.datasourceUrl ? { datasourceUrl: options.datasourceUrl } : {}),
+    log: options.log ?? ['warn', 'error'],
+  })
+}
+
+/**
+ * Client for the genuine cross-tenant / pre-tenant reads — the public landing
+ * slug resolve, the QR table resolve, the outbox worker sweep, the login
+ * membership list. It connects as `brewsync_system` (BYPASSRLS), the ONE role
+ * Postgres exempts from RLS, so these reads see rows across tenants without a
+ * bound `app.current_tenant` GUC.
+ *
+ * Deliberately separate from `createUnscopedPrismaClient` despite the identical
+ * shape: the name and the datasource URL (which must point at the BYPASSRLS
+ * role) are the contract. No tenant-scope extension, no GUC binding — and by
+ * design the role has SELECT only, never DML, so nothing here can write across
+ * tenants.
+ */
+export function createSystemPrismaClient(options: PrismaClientOptions = {}) {
   return new PrismaClient({
     ...(options.datasourceUrl ? { datasourceUrl: options.datasourceUrl } : {}),
     log: options.log ?? ['warn', 'error'],

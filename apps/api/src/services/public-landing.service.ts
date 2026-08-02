@@ -5,10 +5,10 @@
  * seam between a public, unauthenticated request and the tenant world:
  *
  *   1. `resolveSlug(slug)` is the ONE place a client string maps to a tenant. It
- *      runs `runUnscoped` (like the outbox worker / QR resolve) because no tenant
- *      context exists yet and RLS returns zero rows without a bound GUC. Only a
- *      PUBLISHED page resolves; everything downstream uses the *resolved* tenant/
- *      outlet ids — never client input.
+ *      reads through the system client (`brewsync_system`, BYPASSRLS) because no
+ *      tenant context exists yet and the RLS-subject app client returns zero rows
+ *      without a bound GUC. Only a PUBLISHED page resolves; everything downstream
+ *      uses the *resolved* tenant/outlet ids — never client input.
  *   2. `buildPage(resolved)` binds that resolved context via
  *      `runWithTenantContext`, asserts the `landingPage` feature is on, and reads
  *      the page + its ordered sections. CATALOG sections pull products LIVE from
@@ -20,21 +20,21 @@
  * leaks, exactly as QR masks a disabled toggle behind `QR_INVALID`.
  *
  * Slug uniqueness: the schema enforces `@@unique([tenantId, slug])`, so a slug is
- * unique per tenant, not globally. Resolution is therefore a `runUnscoped`
- * `findFirst` on `{ slug, status: PUBLISHED }` rather than a `findUnique` — two
- * tenants publishing the same slug is an admin-facing collision (surfaced when
- * they pick the slug in the CMS, S9-02), not something this read guesses at.
+ * unique per tenant, not globally. Resolution is therefore a `findFirst` on
+ * `{ slug, status: PUBLISHED }` rather than a `findUnique` — two tenants
+ * publishing the same slug is an admin-facing collision (surfaced when they pick
+ * the slug in the CMS, S9-02), not something this read guesses at.
  */
 
 import {
   type BrewsyncClient,
-  runUnscoped,
   runWithTenantContext,
 } from '@brewsync/db'
 import { notFound } from '../http-error.js'
 import { FeatureService } from './feature.service.js'
 import { ProductService } from './product.service.js'
 import { PriceService } from './price.service.js'
+import type { SystemClient } from '../system-client.js'
 
 /** A landing page resolved from its public slug — the trusted ids downstream ops use. */
 export interface ResolvedLandingPage {
@@ -50,21 +50,27 @@ interface CatalogContent {
 }
 
 export class PublicLandingService {
-  constructor(private readonly db: BrewsyncClient) {}
+  constructor(
+    private readonly db: BrewsyncClient,
+    private readonly system: SystemClient
+  ) {}
 
   /**
-   * Maps a public slug to its PUBLISHED landing page. The single sanctioned
-   * `runUnscoped` read in this flow (mirrors the outbox worker / QR resolve): no
-   * tenant context is available yet. A missing page OR a draft both throw the
-   * opaque `LANDING_INVALID` — the caller never learns which.
+   * Maps a public slug to its PUBLISHED landing page. Runs on the system client
+   * (`brewsync_system`, BYPASSRLS): no tenant context exists yet, and the app
+   * client's RLS returns zero rows without a bound GUC. The slug is globally
+   * unique per schema (`@@unique([tenantId, slug])`), so a cross-tenant read is
+   * the correct one here — the caller picks the tenant BY giving its slug. A
+   * missing page OR a draft both throw the opaque `LANDING_INVALID` — the caller
+   * never learns which.
    */
   async resolveSlug(slug: string): Promise<ResolvedLandingPage> {
-    const page = await runUnscoped(() =>
-      this.db.landingPage.findFirst({
-        where: { slug, status: 'PUBLISHED' },
-        select: { id: true, tenantId: true, outletId: true },
-      })
-    )
+    // No runUnscoped frame needed: the system client has no tenant-scope
+    // extension, so the query dispatches with no context at all.
+    const page = await this.system.landingPage.findFirst({
+      where: { slug, status: 'PUBLISHED' },
+      select: { id: true, tenantId: true, outletId: true },
+    })
     if (!page) {
       throw notFound('LANDING_INVALID', 'This page is not available.')
     }

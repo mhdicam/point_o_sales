@@ -7,10 +7,11 @@
  * world:
  *
  *   1. `resolveTable(token)` is the ONE place a client string maps to a tenant.
- *      It runs `runUnscoped` (like the outbox worker) because no tenant context
- *      exists yet and RLS returns zero rows without a bound GUC. Everything
- *      downstream uses the *resolved* tenant/outlet/table ids — never client
- *      input — which is why a public write here is not an escalation hole.
+ *      It reads through the system client (`brewsync_system`, BYPASSRLS) because
+ *      no tenant context exists yet and the RLS-subject app client returns zero
+ *      rows without a bound GUC. Everything downstream uses the *resolved*
+ *      tenant/outlet/table ids — never client input — which is why a public
+ *      write here is not an escalation hole.
  *   2. `menu(resolved)` and `placeOrder(resolved, items)` bind that resolved
  *      context via `runWithTenantContext` / `withTenantTransaction`, so the
  *      Prisma extension + RLS scope every read and write exactly as for a staff
@@ -33,7 +34,6 @@ import {
   type PrismaClient,
   type OutboxCapableTx,
   type Prisma,
-  runUnscoped,
   runWithTenantContext,
   withTenantTransaction,
   emitEvent,
@@ -44,6 +44,7 @@ import { FeatureService } from './feature.service.js'
 import { ProductService } from './product.service.js'
 import { PriceService } from './price.service.js'
 import { OrderService, type OrderItemInput } from './order.service.js'
+import type { SystemClient } from '../system-client.js'
 
 type Tx = Prisma.TransactionClient
 
@@ -56,21 +57,24 @@ export interface ResolvedTable {
 }
 
 export class QrOrderService {
-  constructor(private readonly db: BrewsyncClient) {}
+  constructor(
+    private readonly db: BrewsyncClient,
+    private readonly system: SystemClient
+  ) {}
 
   /**
-   * Maps a QR token to its table. The single sanctioned `runUnscoped` read in
-   * this flow (mirrors the outbox worker): the token is globally unique, so no
-   * tenant context is needed — or available — yet. A missing/inactive table
-   * throws the opaque `QR_INVALID`; the caller never learns why.
+   * Maps a QR token to its table. Runs on the system client (`brewsync_system`,
+   * BYPASSRLS): the token is globally unique, so no tenant context is needed — or
+   * available — yet, and the app client's RLS would return zero rows without a
+   * bound GUC. The resolved ids feed every downstream op — never client input. A
+   * missing/inactive table throws the opaque `QR_INVALID`; the caller never
+   * learns why.
    */
   async resolveTable(qrToken: string): Promise<ResolvedTable> {
-    const table = await runUnscoped(() =>
-      this.db.table.findUnique({
-        where: { qrToken },
-        select: { id: true, name: true, isActive: true, tenantId: true, outletId: true },
-      })
-    )
+    const table = await this.system.table.findUnique({
+      where: { qrToken },
+      select: { id: true, name: true, isActive: true, tenantId: true, outletId: true },
+    })
     if (!table || !table.isActive) {
       throw notFound('QR_INVALID', 'This QR code is not valid.')
     }

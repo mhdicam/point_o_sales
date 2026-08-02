@@ -21,6 +21,7 @@ import type { BrewsyncClient } from '@brewsync/db'
 import { PublicLandingService } from '../services/public-landing.service.js'
 import { createRateLimit } from '../middleware/rate-limit.js'
 import { notFound } from '../http-error.js'
+import type { SystemClient } from '../system-client.js'
 
 /** Pull the `:slug` path param as a plain string; a malformed one is opaque. */
 function readSlug(raw: unknown): string {
@@ -30,9 +31,9 @@ function readSlug(raw: unknown): string {
   return raw
 }
 
-export function createPublicLandingRouter(db: BrewsyncClient): Router {
+export function createPublicLandingRouter(db: BrewsyncClient, system: SystemClient): Router {
   const router = Router()
-  const landing = new PublicLandingService(db)
+  const landing = new PublicLandingService(db, system)
 
   // Public-read throttle, same shape as the QR menu read.
   const readLimit = createRateLimit({ windowMs: 60_000, max: 60, code: 'LANDING_RATE_LIMITED' })
