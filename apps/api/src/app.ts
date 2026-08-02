@@ -43,6 +43,7 @@ import { createSupplierRouter } from './routes/supplier.routes.js'
 import { createPurchaseOrderRouter } from './routes/purchase-order.routes.js'
 import { createReservationRouter } from './routes/reservation.routes.js'
 import { createQrRouter } from './routes/qr.routes.js'
+import { createPublicLandingRouter } from './routes/public-landing.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
 export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
@@ -97,6 +98,14 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // pre-tenant routes. It carries its own per-IP rate limiter; `/pin` and future
   // `/online` ordering should adopt the same `createRateLimit` factory.
   app.use(createQrRouter(db))
+
+  // S9-03 — public landing page (`/p/:slug`). Pre-tenant by necessity: a customer
+  // opening a public catalog holds no token. The router self-binds tenant/outlet
+  // context from the resolved PUBLISHED slug (never client input), gated on the
+  // `landingPage` feature inside the service, and carries its own per-IP limiter.
+  // The authenticated `/landing` CMS surface (S9-02) mounts after the tenant
+  // middleware below.
+  app.use(createPublicLandingRouter(db))
 
   // ---- Everything below requires a valid access token. ----
 
