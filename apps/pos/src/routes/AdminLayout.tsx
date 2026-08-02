@@ -21,10 +21,14 @@ interface NavItem {
 }
 
 function useNavItems(): NavItem[] {
+  const canOrder = usePermission(PERMISSIONS.ORDER_CREATE)
   const canProduct = usePermission(PERMISSIONS.PRODUCT_VIEW)
   const canPrice = usePermission(PERMISSIONS.PRICE_EDIT)
+  const canShift = usePermission(PERMISSIONS.SHIFT_OPEN)
   const modifiersOn = useFeature('modifiers')
   return [
+    { to: '/admin/order', label: 'Order', show: canOrder },
+    { to: '/admin/shift', label: 'Shift', show: canShift },
     { to: '/admin/products', label: 'Products', show: canProduct },
     { to: '/admin/categories', label: 'Categories', show: canProduct },
     { to: '/admin/units', label: 'Units', show: canProduct },

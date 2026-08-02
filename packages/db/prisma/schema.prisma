@@ -59,6 +59,15 @@ model Tenant {
   orderItems   OrderItem[]
   orderCharges OrderCharge[]
 
+  // Payment — S5
+  paymentMethods PaymentMethod[]
+  bills          Bill[]
+  payments       Payment[]
+
+  // Shift — S5
+  shifts        Shift[]
+  cashMovements CashMovement[]
+
   @@map("tenants")
 }
 
@@ -92,6 +101,7 @@ model Outlet {
   userRoles    UserRole[]
   outboxEvents OutboxEvent[]
   orders       Order[]
+  shifts       Shift[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -757,6 +767,7 @@ model Order {
   outlet  Outlet        @relation(fields: [outletId], references: [id], onDelete: Restrict)
   items   OrderItem[]
   charges OrderCharge[]
+  bills   Bill[]
 
   @@index([tenantId])
   @@index([outletId])
@@ -833,4 +844,225 @@ model OrderCharge {
   @@index([orderId])
   @@index([orderItemId])
   @@map("order_charges")
+}
+
+// ---------------------------------------------------------------------------
+// Payment — S5-01, S5-02 (design §7)
+//
+// Three distinct levels (§7): Order = "what was ordered", Bill = "what must be
+// paid" (created at BILLED, a frozen snapshot of the pipeline total), Payment =
+// "how it was paid" (one row per tender). Split payment = many Payment per Bill;
+// split bill = many Bill per Order, with the invariant SUM(bill.total) === order
+// total after rounding (§7.3). Refund = a negative Payment (§7.4) — append-only,
+// never a hard delete, so the cash trail stays intact (standard #3).
+// ---------------------------------------------------------------------------
+
+/// Design §7.5 — tender types are data, not code. Adding "GoPay" is a new
+/// PaymentMethod row, never a new branch. `kind` is a coarse classifier for
+/// reporting/icons; the three booleans drive behaviour (drawer, ref capture,
+/// cash reconciliation).
+enum PaymentMethodKind {
+  CASH
+  CARD
+  QRIS
+  EWALLET
+  VOUCHER
+  POINTS
+  OTHER
+}
+
+/// Design §7.5 — a tender a tenant accepts. Per-tenant so each business curates
+/// its own list. The flags are what §14 reconciliation and the drawer logic read.
+model PaymentMethod {
+  id       String            @id @default(uuid()) @db.Uuid
+  tenantId String            @db.Uuid
+  code     String
+  name     String
+  kind     PaymentMethodKind @default(OTHER)
+
+  /// Cash-drawer kick on accept (§7.5). Cash and manual-change tenders set this.
+  opensCashDrawer Boolean @default(false)
+  /// Require a reference number (card approval code, QRIS txn id) at capture.
+  needsRefNo      Boolean @default(false)
+  /// Contributes to the shift cash drawer (§14.2) — only these create a
+  /// CASH_SALE / CASH_REFUND movement. Card/QRIS never touch the drawer.
+  countsAsCash    Boolean @default(false)
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  payments Payment[]
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("payment_methods")
+}
+
+/// Design §7.1 — the tagihan snapshot, created when an order reaches BILLED. Its
+/// `subtotal`/`total` freeze the pipeline result (§6) so a later master-data edit
+/// never shifts a historical bill (standard #7). One order has one Bill in the
+/// simple path and several when split (§7.3); `seq` orders them (1-based) and the
+/// invariant SUM(total) === order total is enforced at split time and tested.
+model Bill {
+  id       String     @id @default(uuid()) @db.Uuid
+  tenantId String     @db.Uuid
+  orderId  String     @db.Uuid
+  /// 1-based sequence within the order. A single (non-split) order has seq 1.
+  seq      Int        @default(1)
+  status   BillStatus @default(OPEN)
+
+  /// Frozen pipeline outputs (minor units, standard #2). `total` is what the
+  /// payments must cover for the bill to settle.
+  subtotal BigInt
+  total    BigInt
+
+  /// Human label for a split share ("Bill 1/3", "Andi"). Null for a single bill.
+  label String?
+
+  paidAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  order    Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  payments Payment[]
+
+  @@unique([orderId, seq])
+  @@index([tenantId])
+  @@index([orderId])
+  @@map("bills")
+}
+
+enum BillStatus {
+  OPEN
+  PAID
+  VOID
+}
+
+/// Design §7.2 / §7.4 — one tender against a bill. `amount` is signed minor
+/// units: positive is a payment, negative is a refund (§7.4). The bill settles
+/// when SUM(amount) >= bill.total. `changeGiven` is recorded (not netted into
+/// amount) so the tender the customer handed over and the change returned are
+/// both auditable. Append-only: a mistaken tender is reversed with another
+/// negative row, never deleted (standard #3).
+model Payment {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  billId   String @db.Uuid
+  methodId String @db.Uuid
+
+  amount      BigInt
+  /// Cash handed back on an over-tender. Recorded on the settling cash row.
+  changeGiven BigInt @default(0)
+  /// Reference captured when the method needs one (card/QRIS), else null.
+  refNo       String?
+  /// Required for a refund (§7.4): why money was returned.
+  reason      String?
+
+  /// Membership user who took the tender (audit). Null for system/automated rows.
+  createdByUserId String? @db.Uuid
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  bill   Bill          @relation(fields: [billId], references: [id], onDelete: Cascade)
+  method PaymentMethod @relation(fields: [methodId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([billId])
+  @@index([methodId])
+  @@map("payments")
+}
+
+/// Design §14.1 — a cashier's till session. The drawer's cash is a derived
+/// balance, never a stored column (standard #3): expectedCash = openingFloat +
+/// SUM(CashMovement.amount) for this shift. Open emits `ShiftOpened`, close emits
+/// `ShiftClosed` with the reconciliation figures. At most one OPEN shift per
+/// (outlet, registerId) at a time — enforced by a partial unique index in the
+/// migration (Prisma cannot express "unique WHERE status = OPEN").
+model Shift {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String  @db.Uuid
+  outletId   String  @db.Uuid
+  /// Physical register/device the drawer belongs to. Null = the outlet's single
+  /// drawer. The one-open-shift rule is per (outlet, registerId).
+  registerId String?
+
+  openedByUserId String   @db.Uuid
+  /// Cash placed in the drawer at open (minor units). Baseline for reconciliation.
+  openingFloat   BigInt
+  openedAt       DateTime @default(now())
+
+  closedByUserId     String?   @db.Uuid
+  /// Physical cash counted at close (minor units). Null until closed.
+  closingCountedCash BigInt?
+  /// System-derived expected cash at close: openingFloat + SUM(movements).
+  expectedCash       BigInt?
+  /// closingCountedCash − expectedCash (signed): negative = short, positive = over.
+  cashVariance       BigInt?
+  closedAt           DateTime?
+
+  status ShiftStatus @default(OPEN)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant    Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet    Outlet         @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  movements CashMovement[]
+
+  @@index([tenantId])
+  @@index([outletId])
+  @@map("shifts")
+}
+
+enum ShiftStatus {
+  OPEN
+  CLOSED
+}
+
+/// Design §14.2 — an append-only cash-drawer ledger row. Never updated or
+/// deleted (standard #3); the drawer balance is always SUM over these. A cash
+/// tender (`PaymentMethod.countsAsCash`) produces a CASH_SALE; a cash refund a
+/// CASH_REFUND. PAID_OUT/DROP are negative; OPENING_FLOAT/PAID_IN positive. The
+/// `amount` sign is authoritative — the type is descriptive.
+model CashMovement {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  shiftId  String @db.Uuid
+
+  type   CashMovementType
+  /// Signed minor units. Sign matches the type (see §14.2 table).
+  amount BigInt
+
+  /// Origin of the movement — e.g. ('payment', paymentId) for a CASH_SALE.
+  refType String?
+  refId   String? @db.Uuid
+  /// Required for PAID_IN / PAID_OUT (§14.2): why cash moved.
+  reason  String?
+
+  createdByUserId String?  @db.Uuid
+  createdAt       DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  shift  Shift  @relation(fields: [shiftId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([shiftId])
+  @@map("cash_movements")
+}
+
+enum CashMovementType {
+  OPENING_FLOAT
+  CASH_SALE
+  CASH_REFUND
+  PAID_IN
+  PAID_OUT
+  DROP
 }

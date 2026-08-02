@@ -72,4 +72,11 @@ export const RLS_TABLES = [
   'orders',
   'order_items',
   'order_charges',
+  // Payment — S5
+  'payment_methods',
+  'bills',
+  'payments',
+  // Shift — S5
+  'shifts',
+  'cash_movements',
 ] as const

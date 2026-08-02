@@ -57,6 +57,7 @@ import {
   type DiscountInput,
   type ItemDiscountInput,
   type FiscalConfig,
+  type PipelineInput,
   type PipelineLine,
 } from './order.pipeline.js'
 
@@ -290,9 +291,15 @@ export class OrderService {
   /**
    * Raises the bill. SENT/SERVED → BILLED.
    *
-   * One final recompute produces the authoritative rows, then the status flips —
-   * after which no mutation recomputes, so these rows are frozen (§7.1). Emits
-   * nothing: SaleCompleted is an S5 concern, at PAID.
+   * One final recompute produces the authoritative charge rows, then the status
+   * flips — after which no mutation recomputes, so those rows are frozen (§7.1).
+   * The same moment snapshots the money into a single `Bill` (seq 1): its `total`
+   * is `amountDue` (the §6 total plus gratuity — what the customer actually
+   * hands over), so a later master-data edit never shifts this bill (standard
+   * #7). Splitting into several bills is a separate S5 operation on top of this
+   * one; the single bill here satisfies SUM(bill.total) === order total trivially.
+   *
+   * Emits nothing: SaleCompleted is emitted at PAID by the payment path.
    */
   async bill(orderId: string) {
     return this.inTx(async (tx) => {
@@ -300,9 +307,21 @@ export class OrderService {
       this.assertTransition(order.status, 'BILLED')
 
       await this.recompute(tx, orderId)
+      const summary = await this.computeSummary(tx, orderId)
       await tx.order.update({
         where: { id: orderId },
         data: { status: 'BILLED', billedAt: new Date() },
+      })
+
+      // Idempotent on re-bill (the machine forbids re-entering BILLED, so this
+      // only ever inserts once): the single snapshot bill for the whole order.
+      await tx.bill.create({
+        data: {
+          orderId,
+          seq: 1,
+          subtotal: summary.subtotal,
+          total: summary.amountDue,
+        } as unknown as Prisma.BillCreateInput,
       })
       return this.load(tx, orderId)
     })
@@ -400,82 +419,8 @@ export class OrderService {
    * pipeline, then rewrites the full breakdown. Never called after BILLED.
    */
   private async recompute(tx: Tx, orderId: string): Promise<void> {
-    const order = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { outletId: true, salesMethod: true, sentAt: true },
-    })
-    const items = await tx.orderItem.findMany({
-      where: { orderId },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-      select: {
-        id: true,
-        variantId: true,
-        qty: true,
-        priceSnapshot: true,
-        modifierDeltaSnapshot: true,
-      },
-    })
-    const existing = await tx.orderCharge.findMany({
-      where: { orderId },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-      select: { kind: true, label: true, rateBp: true, amount: true, orderItemId: true },
-    })
-
-    // Step 1 inputs — line subtotals. Live price while OPEN; frozen snapshot after SENT.
-    let lines: PipelineLine[]
-    if (order.sentAt === null) {
-      const priceSvc = new PriceService(tx as unknown as BrewsyncClient)
-      const prices = await priceSvc.resolveMany(items.map((i) => i.variantId), {
-        outletId: order.outletId,
-        salesMethod: order.salesMethod,
-      })
-      lines = items.map((i) => ({
-        subtotalMinor: (prices.get(i.variantId)!.price + i.modifierDeltaSnapshot) * BigInt(i.qty),
-      }))
-    } else {
-      lines = items.map((i) => ({
-        subtotalMinor: (i.priceSnapshot + i.modifierDeltaSnapshot) * BigInt(i.qty),
-      }))
-    }
-
-    // Reconstruct discounts from the durable DISCOUNT rows, preserving apply order.
-    const indexById = new Map(items.map((it, idx) => [it.id, idx]))
-    const itemDiscounts: ItemDiscountInput[] = []
-    const orderDiscounts: DiscountInput[] = []
-    for (const c of existing) {
-      if (c.kind !== 'DISCOUNT') continue
-      const magnitude = c.amount < 0n ? -c.amount : c.amount
-      const base: DiscountInput =
-        c.rateBp !== null ? { label: c.label, rateBp: c.rateBp } : { label: c.label, amountMinor: magnitude }
-      if (c.orderItemId !== null) {
-        const lineIndex = indexById.get(c.orderItemId)
-        if (lineIndex === undefined) continue // line gone; discount is moot
-        itemDiscounts.push({ ...base, lineIndex })
-      } else {
-        orderDiscounts.push(base)
-      }
-    }
-
-    const gratuityRow = existing.find((c) => c.kind === 'GRATUITY')
-    const gratuityMinor = gratuityRow ? (gratuityRow.amount < 0n ? -gratuityRow.amount : gratuityRow.amount) : 0n
-
-    const outlet = await tx.outlet.findUniqueOrThrow({
-      where: { id: order.outletId },
-      select: {
-        taxInclusive: true,
-        taxRateBp: true,
-        serviceChargeRateBp: true,
-        roundingIncrement: true,
-      },
-    })
-    const fiscal: FiscalConfig = {
-      taxInclusive: outlet.taxInclusive,
-      taxRateBp: outlet.taxRateBp,
-      serviceChargeRateBp: outlet.serviceChargeRateBp,
-      roundingIncrement: outlet.roundingIncrement,
-    }
-
-    const result = runBillPipeline({ lines, fiscal, itemDiscounts, orderDiscounts, gratuityMinor })
+    const { pipelineInput, items, itemDiscounts } = await this.gatherPipeline(tx, orderId)
+    const result = runBillPipeline(pipelineInput)
 
     // Re-associate item discounts to their line. The pipeline emits item
     // discounts (in input order) before order discounts, so the k-th DISCOUNT
@@ -507,6 +452,115 @@ export class OrderService {
       await tx.orderCharge.createMany({
         data: rows as unknown as Prisma.OrderChargeCreateManyInput[],
       })
+    }
+  }
+
+  /**
+   * Assembles the pure pipeline inputs from persisted state — the single seam
+   * shared by the write path (`recompute`, which rewrites the charge rows) and
+   * the read path (`computeSummary`, which derives the summary for `load`).
+   * Keeping it in one place is what guarantees the total a client is shown is the
+   * total that gets persisted: both run identical inputs through the same pipeline.
+   *
+   * Line prices are live through `PriceService` while OPEN (sentAt null) and read
+   * from the frozen `priceSnapshot` after SENT (standard #7). Discounts and
+   * gratuity are reconstructed from their durable `OrderCharge` rows.
+   */
+  private async gatherPipeline(
+    client: Tx | BrewsyncClient,
+    orderId: string
+  ): Promise<{
+    pipelineInput: PipelineInput
+    items: { id: string; unitPriceMinor: bigint; lineSubtotalMinor: bigint }[]
+    itemDiscounts: ItemDiscountInput[]
+  }> {
+    const order = await client.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { outletId: true, salesMethod: true, sentAt: true },
+    })
+    const items = await client.orderItem.findMany({
+      where: { orderId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        variantId: true,
+        qty: true,
+        priceSnapshot: true,
+        modifierDeltaSnapshot: true,
+      },
+    })
+    const existing = await client.orderCharge.findMany({
+      where: { orderId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: { kind: true, label: true, rateBp: true, amount: true, orderItemId: true },
+    })
+
+    // Step 1 inputs — unit price then line subtotal. Live price while OPEN;
+    // frozen snapshot after SENT. `unitPriceMinor` includes the modifier delta so
+    // the FE can show a meaningful per-line price without any money math.
+    let unitPriceOf: (item: (typeof items)[number]) => bigint
+    if (order.sentAt === null) {
+      const priceSvc = new PriceService(client as unknown as BrewsyncClient)
+      const prices = await priceSvc.resolveMany(items.map((i) => i.variantId), {
+        outletId: order.outletId,
+        salesMethod: order.salesMethod,
+      })
+      unitPriceOf = (i) => prices.get(i.variantId)!.price + i.modifierDeltaSnapshot
+    } else {
+      unitPriceOf = (i) => i.priceSnapshot + i.modifierDeltaSnapshot
+    }
+
+    const priced = items.map((i) => {
+      const unitPriceMinor = unitPriceOf(i)
+      return {
+        id: i.id,
+        unitPriceMinor,
+        lineSubtotalMinor: unitPriceMinor * BigInt(i.qty),
+      }
+    })
+    const lines: PipelineLine[] = priced.map((p) => ({ subtotalMinor: p.lineSubtotalMinor }))
+
+    // Reconstruct discounts from the durable DISCOUNT rows, preserving apply order.
+    const indexById = new Map(items.map((it, idx) => [it.id, idx]))
+    const itemDiscounts: ItemDiscountInput[] = []
+    const orderDiscounts: DiscountInput[] = []
+    for (const c of existing) {
+      if (c.kind !== 'DISCOUNT') continue
+      const magnitude = c.amount < 0n ? -c.amount : c.amount
+      const base: DiscountInput =
+        c.rateBp !== null ? { label: c.label, rateBp: c.rateBp } : { label: c.label, amountMinor: magnitude }
+      if (c.orderItemId !== null) {
+        const lineIndex = indexById.get(c.orderItemId)
+        if (lineIndex === undefined) continue // line gone; discount is moot
+        itemDiscounts.push({ ...base, lineIndex })
+      } else {
+        orderDiscounts.push(base)
+      }
+    }
+
+    const gratuityRow = existing.find((c) => c.kind === 'GRATUITY')
+    const gratuityMinor = gratuityRow ? (gratuityRow.amount < 0n ? -gratuityRow.amount : gratuityRow.amount) : 0n
+
+    const outlet = await client.outlet.findUniqueOrThrow({
+      where: { id: order.outletId },
+      select: {
+        taxInclusive: true,
+        taxRateBp: true,
+        serviceChargeRateBp: true,
+        roundingIncrement: true,
+      },
+    })
+    const fiscal: FiscalConfig = {
+      taxInclusive: outlet.taxInclusive,
+      taxRateBp: outlet.taxRateBp,
+      serviceChargeRateBp: outlet.serviceChargeRateBp,
+      roundingIncrement: outlet.roundingIncrement,
+    }
+
+    return {
+      pipelineInput: { lines, fiscal, itemDiscounts, orderDiscounts, gratuityMinor },
+      items: priced,
+      itemDiscounts,
     }
   }
 
@@ -589,14 +643,70 @@ export class OrderService {
       .filter((id): id is string => typeof id === 'string')
   }
 
+  /**
+   * Reads one order with its lines, charge breakdown, and a derived money
+   * summary.
+   *
+   * The persisted rows carry the *breakdown* but not a subtotal/total, and while
+   * OPEN a line's `priceSnapshot` is still zero (it freezes at SENT). The cashier
+   * screen nonetheless needs a running total and per-line prices as it builds the
+   * order. So `load` re-runs the same pure pipeline on read (`computeSummary`) —
+   * deterministic on frozen inputs post-SENT, live-priced while OPEN — and folds
+   * `unitPrice`/`lineSubtotal` onto each item plus a `summary`. Every amount stays
+   * a BigInt, so the money never becomes a float and the wire carries decimal
+   * strings (standard #2). The FE renders these rows; it does no money math.
+   */
   private async load(client: Tx | BrewsyncClient, orderId: string) {
-    return client.order.findUnique({
+    const order = await client.order.findUnique({
       where: { id: orderId },
       include: {
         items: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
         charges: { orderBy: { sortOrder: 'asc' } },
+        bills: {
+          orderBy: { seq: 'asc' },
+          include: { payments: { orderBy: { createdAt: 'asc' } } },
+        },
       },
     })
+    if (!order) return null
+
+    const summary = await this.computeSummary(client, orderId)
+    const priceByItem = new Map(summary.lines.map((l) => [l.id, l]))
+    return {
+      ...order,
+      items: order.items.map((item) => {
+        const line = priceByItem.get(item.id)
+        return {
+          ...item,
+          unitPrice: line?.unitPriceMinor ?? 0n,
+          lineSubtotal: line?.lineSubtotalMinor ?? 0n,
+        }
+      }),
+      summary: {
+        subtotal: summary.subtotal,
+        total: summary.total,
+        amountDue: summary.amountDue,
+        taxContributesToTotal: summary.taxContributesToTotal,
+      },
+    }
+  }
+
+  /**
+   * Runs the pipeline as a pure read — no charge rewrite — to derive the
+   * subtotal/total/amountDue and per-line display prices for `load`. Shares
+   * `gatherPipeline` with `recompute`, so the numbers a client sees are computed
+   * by exactly the same code that persists the charges: they cannot drift.
+   */
+  private async computeSummary(client: Tx | BrewsyncClient, orderId: string) {
+    const gathered = await this.gatherPipeline(client, orderId)
+    const result = runBillPipeline(gathered.pipelineInput)
+    return {
+      lines: gathered.items,
+      subtotal: result.subtotal as bigint,
+      total: result.total as bigint,
+      amountDue: result.amountDue as bigint,
+      taxContributesToTotal: result.taxContributesToTotal,
+    }
   }
 
   private async requireOrder(tx: Tx, orderId: string) {

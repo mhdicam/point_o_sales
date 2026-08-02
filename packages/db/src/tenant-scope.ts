@@ -56,6 +56,13 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Order',
   'OrderItem',
   'OrderCharge',
+  // Payment — S5
+  'PaymentMethod',
+  'Bill',
+  'Payment',
+  // Shift — S5
+  'Shift',
+  'CashMovement',
 ])
 
 /**

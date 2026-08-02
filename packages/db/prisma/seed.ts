@@ -89,6 +89,29 @@ async function main() {
       })
     }
 
+    // S5-02 — default tenders (design §7.5). Data-driven: the flags drive
+    // drawer/ref/cash-reconciliation behaviour, so a new method is a new row.
+    const paymentMethods: {
+      code: string
+      name: string
+      kind: 'CASH' | 'CARD' | 'QRIS' | 'EWALLET' | 'VOUCHER' | 'POINTS' | 'OTHER'
+      opensCashDrawer: boolean
+      needsRefNo: boolean
+      countsAsCash: boolean
+      sortOrder: number
+    }[] = [
+      { code: 'CASH', name: 'Tunai', kind: 'CASH', opensCashDrawer: true, needsRefNo: false, countsAsCash: true, sortOrder: 1 },
+      { code: 'CARD', name: 'Kartu Debit/Kredit', kind: 'CARD', opensCashDrawer: false, needsRefNo: true, countsAsCash: false, sortOrder: 2 },
+      { code: 'QRIS', name: 'QRIS', kind: 'QRIS', opensCashDrawer: false, needsRefNo: true, countsAsCash: false, sortOrder: 3 },
+    ]
+    for (const pm of paymentMethods) {
+      await prisma.paymentMethod.upsert({
+        where: { tenantId_code: { tenantId: tenant.id, code: pm.code } },
+        update: {},
+        create: { tenantId: tenant.id, ...pm },
+      })
+    }
+
     // Preset roles are cloned per tenant with isSystem = true (design §12.2).
     const roleIds = new Map<string, string>()
     for (const preset of PRESET_ROLES) {

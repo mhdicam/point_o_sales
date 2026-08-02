@@ -32,6 +32,8 @@ import {
 import { createModifierRouter, createProductModifierRouter } from './routes/modifier.routes.js'
 import { createPriceRouter } from './routes/price.routes.js'
 import { createOrderRouter } from './routes/order.routes.js'
+import { createPaymentRouter } from './routes/payment.routes.js'
+import { createShiftRouter } from './routes/shift.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
 export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
@@ -109,6 +111,11 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   app.use('/products', createProductModifierRouter(db))
   app.use('/prices', createPriceRouter(db))
   app.use('/orders', createOrderRouter(db))
+  // S5-01..05 — bills, tenders, split, refund. Sits after /orders because it
+  // settles orders the bill pipeline (S4) produced.
+  app.use('/payments', createPaymentRouter(db))
+  // S5-06/07 — shift open/close + cash drawer ledger.
+  app.use('/shifts', createShiftRouter(db))
 
   // S2-04/S2-07 — reference wiring for the two guards. Real feature routes
   // replace this in S3+.

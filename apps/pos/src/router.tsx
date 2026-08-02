@@ -34,6 +34,15 @@ const ModifiersScreen = lazy(() =>
 const PriceListsScreen = lazy(() =>
   import('./routes/PriceListsScreen.tsx').then((m) => ({ default: m.PriceListsScreen }))
 )
+const OrderScreen = lazy(() =>
+  import('./routes/order/OrderScreen.tsx').then((m) => ({ default: m.OrderScreen }))
+)
+const PaymentScreen = lazy(() =>
+  import('./routes/payment/PaymentScreen.tsx').then((m) => ({ default: m.PaymentScreen }))
+)
+const ShiftScreen = lazy(() =>
+  import('./routes/shift/ShiftScreen.tsx').then((m) => ({ default: m.ShiftScreen }))
+)
 
 function Lazy({ children }: { children: ReactNode }): ReactNode {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>
@@ -48,6 +57,9 @@ export const router: RouterProviderProps['router'] = createBrowserRouter([
     children: [
       { element: <AdminLayout />, children: [
         { index: true, element: <Navigate to="products" replace /> },
+        { path: 'order', element: <Lazy><OrderScreen /></Lazy> },
+        { path: 'pay/:orderId', element: <Lazy><PaymentScreen /></Lazy> },
+        { path: 'shift', element: <Lazy><ShiftScreen /></Lazy> },
         { path: 'products', element: <Lazy><ProductsScreen /></Lazy> },
         { path: 'categories', element: <Lazy><CategoriesScreen /></Lazy> },
         { path: 'units', element: <Lazy><UnitsScreen /></Lazy> },
