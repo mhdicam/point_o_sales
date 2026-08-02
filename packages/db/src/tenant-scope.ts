@@ -77,6 +77,8 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Supplier',
   'PurchaseOrder',
   'PurchaseOrderItem',
+  // Reservation — S8
+  'Reservation',
 ])
 
 /**

@@ -93,4 +93,6 @@ export const RLS_TABLES = [
   'suppliers',
   'purchase_orders',
   'purchase_order_items',
+  // Reservation — S8
+  'reservations',
 ] as const

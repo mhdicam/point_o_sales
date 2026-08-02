@@ -134,6 +134,28 @@ export class TableService {
   }
 
   /**
+   * Rotates the QR token (§16.2). Called when a physical QR is replaced or a
+   * token leaks: the old URL stops resolving the moment the new token is stored,
+   * so any QR printed with the previous token is dead. Globally unique, so a
+   * P2002 (astronomically unlikely on 24 random bytes) retries once.
+   */
+  async rotateQrToken(id: string) {
+    await this.getById(id)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await this.db.table.update({
+          where: { id },
+          data: { qrToken: newQrToken() },
+        })
+      } catch (error) {
+        if (isUniqueViolation(error) && attempt === 0) continue
+        throw error
+      }
+    }
+    throw conflict('QR_TOKEN_COLLISION', 'Could not allocate a unique QR token; try again.')
+  }
+
+  /**
    * Deactivates rather than deletes — an order may reference this table and its
    * label must stay resolvable. A hard delete would orphan that history.
    */

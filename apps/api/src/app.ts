@@ -41,6 +41,8 @@ import { createStockRouter } from './routes/stock.routes.js'
 import { createRecipeRouter } from './routes/recipe.routes.js'
 import { createSupplierRouter } from './routes/supplier.routes.js'
 import { createPurchaseOrderRouter } from './routes/purchase-order.routes.js'
+import { createReservationRouter } from './routes/reservation.routes.js'
+import { createQrRouter } from './routes/qr.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
 export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
@@ -88,6 +90,13 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   if (onboardingRouter) {
     app.use('/onboarding', onboardingRouter)
   }
+
+  // S8-06 — QR self-service ordering. Pre-tenant by necessity: a customer
+  // scanning a table QR holds no token. The router self-binds tenant/outlet
+  // context from the resolved token (never client input) — the safest of the
+  // pre-tenant routes. It carries its own per-IP rate limiter; `/pin` and future
+  // `/online` ordering should adopt the same `createRateLimit` factory.
+  app.use(createQrRouter(db))
 
   // ---- Everything below requires a valid access token. ----
 
@@ -137,6 +146,8 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   app.use('/suppliers', createSupplierRouter(db))
   // S6-06 — purchase orders + state machine (gated on the `purchasing` feature).
   app.use('/purchase-orders', createPurchaseOrderRouter(db))
+  // S8-01 — reservations + state machine (gated on the `reservation` feature).
+  app.use('/reservations', createReservationRouter(db))
 
   // S2-04/S2-07 — reference wiring for the two guards. Real feature routes
   // replace this in S3+.

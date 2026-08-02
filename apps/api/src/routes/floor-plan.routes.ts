@@ -183,6 +183,17 @@ export function createFloorPlanRouter(db: BrewsyncClient): Router {
     }
   })
 
+  // S8-05 — rotate the QR token (§16.2) when a physical QR is replaced or leaks.
+  // The old URL dies immediately; a fresh random token is issued.
+  router.post('/tables/:id/rotate-qr', async (req, res, next) => {
+    try {
+      const table = await tables.rotateQrToken(parseId(req.params['id'], 'Table id'))
+      res.json({ table })
+    } catch (error) {
+      next(error)
+    }
+  })
+
   router.delete('/tables/:id', async (req, res, next) => {
     try {
       const table = await tables.deactivate(parseId(req.params['id'], 'Table id'))

@@ -90,6 +90,12 @@ export interface CreateOrderInput {
   outletId: string
   channel?: 'STAFF' | 'QR_TABLE' | 'ONLINE'
   salesMethod?: string | null
+  /**
+   * Seat the new order at this table (§5.4): the table flips OCCUPIED and the
+   * `orders_one_per_table` index guarantees at most one active order per table.
+   * Used by the reservation seat→order flow (§15.3) and QR ordering (§16.2).
+   */
+  tableId?: string | null
   items?: OrderItemInput[]
 }
 
@@ -109,26 +115,58 @@ export class OrderService {
       throw badRequest('INVALID_QTY', 'Item quantity must be a positive integer.')
     }
 
-    return this.inTx(async (tx) => {
-      await this.requireOutlet(tx, input.outletId)
+    return this.inTx((tx) => this.createInTx(tx, input))
+  }
 
-      const order = await tx.order.create({
+  /**
+   * The tx-accepting core of `create` (§5.4). Exposed so a caller already inside
+   * a tenant transaction — the reservation seat → order handoff (§15.3) — can open
+   * the floor order without nesting a second transaction. Seats the table through
+   * the one seat seam when `tableId` is given.
+   */
+  async createInTx(tx: Tx, input: CreateOrderInput) {
+    if (input.items && input.items.some((i) => i.qty <= 0)) {
+      throw badRequest('INVALID_QTY', 'Item quantity must be a positive integer.')
+    }
+
+    await this.requireOutlet(tx, input.outletId)
+
+    // Seat the table first (§5.4): flips it OCCUPIED, asserting availability,
+    // before the order row claims it. The order create then trips the partial
+    // unique index if the table somehow already holds an active order.
+    if (input.tableId) {
+      const table = await this.requireTable(tx, input.tableId)
+      if (table.outletId !== input.outletId) {
+        throw badRequest('TABLE_WRONG_OUTLET', 'The table belongs to another outlet.')
+      }
+      await this.seatTable(tx, table)
+    }
+
+    let order: { id: string }
+    try {
+      order = await tx.order.create({
         data: {
           outletId: input.outletId,
           channel: input.channel ?? 'STAFF',
           salesMethod: input.salesMethod ?? null,
+          tableId: input.tableId ?? null,
           status: 'OPEN',
         } as unknown as Prisma.OrderCreateInput,
         select: { id: true },
       })
-
-      for (const item of input.items ?? []) {
-        await this.insertItem(tx, order.id, item)
+    } catch (err) {
+      if (input.tableId && this.isUniqueViolation(err)) {
+        throw conflict('TABLE_OCCUPIED', 'That table already has an active order.')
       }
+      throw err
+    }
 
-      await this.recompute(tx, order.id)
-      return this.load(tx, order.id)
-    })
+    for (const item of input.items ?? []) {
+      await this.insertItem(tx, order.id, item)
+    }
+
+    await this.recompute(tx, order.id)
+    return this.load(tx, order.id)
   }
 
   /** Adds a line. OPEN only (standard #7 — items freeze at SENT). */
@@ -181,12 +219,21 @@ export class OrderService {
    * edits to a variant or modifier never move this line.
    */
   async send(orderId: string) {
-    const ctx = requireTenantContext()
-    return this.inTx(async (tx) => {
-      const order = await this.requireOrder(tx, orderId)
-      this.assertTransition(order.status, 'SENT')
+    return this.inTx((tx) => this.sendInTx(tx, orderId))
+  }
 
-      const items = await tx.orderItem.findMany({
+  /**
+   * The tx-accepting core of `send` (mirrors the `createInTx` split). Exposed so a
+   * caller already inside a tenant transaction — QR order placement with
+   * auto-accept (§16.2) — can create-then-send in one transaction without nesting
+   * a second `$transaction`. Behaviour is identical to `send`.
+   */
+  async sendInTx(tx: Tx, orderId: string) {
+    const ctx = requireTenantContext()
+    const order = await this.requireOrder(tx, orderId)
+    this.assertTransition(order.status, 'SENT')
+
+    const items = await tx.orderItem.findMany({
         where: { orderId },
         select: { id: true, variantId: true, modifiersSnapshot: true },
       })
@@ -310,7 +357,6 @@ export class OrderService {
 
       await this.recompute(tx, orderId)
       return this.load(tx, orderId)
-    })
   }
 
   /** Marks a sent order delivered. SENT → SERVED. Pure bookkeeping; charges unaffected. */
@@ -340,14 +386,22 @@ export class OrderService {
   /** Applies an order-level discount (§6.4), against the running discounted subtotal. */
   async applyOrderDiscount(orderId: string, input: DiscountInput) {
     this.assertDiscountShape(input)
-    return this.inTx(async (tx) => {
-      const order = await this.requireOrder(tx, orderId)
-      this.assertPreBilled(order.status)
+    return this.inTx((tx) => this.applyOrderDiscountInTx(tx, orderId, input))
+  }
 
-      await this.seedDiscount(tx, orderId, input, null)
-      await this.recompute(tx, orderId)
-      return this.load(tx, orderId)
-    })
+  /**
+   * The tx-accepting core of `applyOrderDiscount`. Exposed so the reservation
+   * seat → order handoff (§15.3) can credit a deposit onto the fresh order within
+   * the same transaction, without nesting a second one.
+   */
+  async applyOrderDiscountInTx(tx: Tx, orderId: string, input: DiscountInput) {
+    this.assertDiscountShape(input)
+    const order = await this.requireOrder(tx, orderId)
+    this.assertPreBilled(order.status)
+
+    await this.seedDiscount(tx, orderId, input, null)
+    await this.recompute(tx, orderId)
+    return this.load(tx, orderId)
   }
 
   /** Sets (or clears, with 0) the gratuity — outside the total, never taxed (§6 step 7). */

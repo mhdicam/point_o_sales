@@ -92,6 +92,9 @@ model Tenant {
   purchaseOrders     PurchaseOrder[]
   purchaseOrderItems PurchaseOrderItem[]
 
+  // Reservation — S8-01
+  reservations Reservation[]
+
   @@map("tenants")
 }
 
@@ -118,6 +121,10 @@ model Outlet {
   stockDeductionPoint StockDeductionPoint @default(PAID)
   cashVarianceToleranceMinor BigInt      @default(0)
 
+  // S8-06 — when true, QR-channel orders are auto-sent to the kitchen on
+  // placement; when false they land OPEN and a waiter accepts (design §16.2).
+  qrAutoAccept Boolean @default(false)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -133,6 +140,9 @@ model Outlet {
   // Inventory & purchasing — S6
   stockMovements StockMovement[]
   purchaseOrders PurchaseOrder[]
+
+  // Reservation — S8-01
+  reservations Reservation[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -898,6 +908,7 @@ model Table {
   outlet Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
   area   Area?   @relation(fields: [areaId], references: [id], onDelete: SetNull)
   orders Order[]
+  reservations Reservation[]
 
   @@unique([outletId, code])
   @@unique([qrToken])
@@ -985,6 +996,7 @@ model Order {
   items   OrderItem[]
   charges OrderCharge[]
   bills   Bill[]
+  reservation Reservation?
 
   @@index([tenantId])
   @@index([outletId])
@@ -1555,4 +1567,88 @@ model PurchaseOrderItem {
   @@index([poId])
   @@index([variantId])
   @@map("purchase_order_items")
+}
+
+// ---------------------------------------------------------------------------
+// Reservation — S8-01 (design §15)
+// ---------------------------------------------------------------------------
+
+/// Design §15.1 — the booking lifecycle. Mirrored by `reservationStateMachine`
+/// in the API. NO_SHOW is reachable only from CONFIRMED; once SEATED the only
+/// exit is COMPLETED (the order takes over). CANCELLED/NO_SHOW/COMPLETED are
+/// terminal.
+enum ReservationStatus {
+  REQUESTED
+  CONFIRMED
+  SEATED
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+}
+
+/// Where the booking came from (§15.2). ONLINE originates from the landing page
+/// (§17) when both `features.reservation` and `features.landingPage` are on.
+enum ReservationSource {
+  STAFF
+  ONLINE
+}
+
+/// Design §15.2 — a reservation. One model, two faces: F&B books a table (+
+/// arrival time), Service books a slot + staff (§5.6). What is reserved is data,
+/// not a code branch. A deposit rides the ordinary Payment path (§7, standard
+/// #2 — minor units); `orderId` is filled at SEATED when the booking hands off
+/// to a live Order. Anti double-booking (§15.3) is enforced in the service, not
+/// the schema — an overlap check over CONFIRMED rows for the same table/staff.
+model Reservation {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  outletId String @db.Uuid
+
+  source ReservationSource @default(STAFF)
+  status ReservationStatus @default(REQUESTED)
+
+  customerName  String
+  customerPhone String
+  customerEmail String?
+  partySize     Int
+
+  /// Arrival time (F&B) / slot start (service). `durationMin` estimates table
+  /// occupancy or the service slot length — used by the overlap guard (§15.3).
+  reservedFor DateTime
+  durationMin Int?
+
+  /// The promised table (F&B, optional — may auto-assign at seating) or the
+  /// assigned staff/resource (service). Kept nullable; one or the other applies.
+  tableId         String? @db.Uuid
+  assignedStaffId String? @db.Uuid
+
+  /// Deposit rides the Payment path (§15.3). Minor units (standard #2); the
+  /// Payment row it links to lives in the same ledger as every other tender.
+  depositAmount    BigInt?
+  depositPaymentId String? @db.Uuid
+
+  notes String?
+
+  /// Filled at SEATED — the live Order this booking became (§15.3). 1:1.
+  orderId String? @db.Uuid
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  createdByUserId String?   @db.Uuid
+  confirmedAt     DateTime?
+  seatedAt        DateTime?
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet Outlet  @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  table  Table?  @relation(fields: [tableId], references: [id], onDelete: SetNull)
+  order  Order?  @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@unique([orderId])
+  @@index([tenantId])
+  @@index([outletId])
+  @@index([tableId])
+  // Drives the §15.3 overlap query: CONFIRMED rows for a table in a time window.
+  @@index([tableId, status])
+  @@index([assignedStaffId, status])
+  @@map("reservations")
 }
