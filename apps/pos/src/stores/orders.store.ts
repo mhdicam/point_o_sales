@@ -31,6 +31,14 @@ export interface AddItemPayload {
   modifierIds?: string[]
 }
 
+/** A charge the server dropped during a merge, surfaced so the UI can warn. */
+export interface MergeWarning {
+  kind: 'ORDER_DISCOUNT_DROPPED' | 'GRATUITY_DROPPED'
+  label: string
+  /** Signed minor-unit amount, decimal string (standard #2). */
+  amount: string
+}
+
 interface OrdersState {
   current: Order | null
   loading: boolean
@@ -55,6 +63,16 @@ interface OrdersState {
   bill: () => Promise<void>
   voidOrder: () => Promise<void>
   voidItem: (itemId: string) => Promise<void>
+  /** Floor operations (§5.4). Move the current order to another table. */
+  transfer: (targetTableId: string) => Promise<void>
+  /**
+   * Merge another order into the current one. The absorbed order's items travel;
+   * its order-level discount and gratuity are dropped — returned as `warnings` so
+   * the caller can tell the cashier.
+   */
+  merge: (absorbedOrderId: string) => Promise<MergeWarning[]>
+  /** Move a subset of the current order's items onto another order. */
+  moveItems: (toOrderId: string, orderItemIds: string[]) => Promise<void>
   /** Drop the working order (after billing, or to start a fresh sale). */
   clear: () => void
 }
@@ -116,6 +134,48 @@ export const useOrdersStore = create<OrdersState>((set, get) => ({
   bill: () => mutate(set, get, (id) => `/orders/${id}/bill`, 'POST'),
   voidOrder: () => mutate(set, get, (id) => `/orders/${id}/void`, 'POST'),
   voidItem: (itemId) => mutate(set, get, (id) => `/orders/${id}/items/${itemId}/void`, 'POST'),
+
+  transfer: (targetTableId) =>
+    mutate(set, get, (id) => `/orders/${id}/transfer`, 'POST', { targetTableId }),
+
+  merge: async (absorbedOrderId) => {
+    const order = get().current
+    if (!order) {
+      set({ error: 'No active order.' })
+      return []
+    }
+    set({ busy: true, error: null })
+    try {
+      const res = await apiRequest<{ order: Order; warnings: MergeWarning[] }>(
+        `/orders/${order.id}/merge`,
+        { method: 'POST', body: { absorbedOrderId } }
+      )
+      set({ current: res.order, busy: false })
+      return res.warnings
+    } catch (err) {
+      set({ error: message(err), busy: false })
+      return []
+    }
+  },
+
+  moveItems: async (toOrderId, orderItemIds) => {
+    const order = get().current
+    if (!order) {
+      set({ error: 'No active order.' })
+      return
+    }
+    set({ busy: true, error: null })
+    try {
+      // Response carries both orders; `current` is the source (`from`).
+      const res = await apiRequest<{ from: Order; to: Order }>(
+        `/orders/${order.id}/move-items`,
+        { method: 'POST', body: { toOrderId, orderItemIds } }
+      )
+      set({ current: res.from, busy: false })
+    } catch (err) {
+      set({ error: message(err), busy: false })
+    }
+  },
 
   clear: () => set({ current: null, error: null, busy: false }),
 }))

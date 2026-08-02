@@ -43,6 +43,12 @@ const PaymentScreen = lazy(() =>
 const ShiftScreen = lazy(() =>
   import('./routes/shift/ShiftScreen.tsx').then((m) => ({ default: m.ShiftScreen }))
 )
+const FloorPlanScreen = lazy(() =>
+  import('./routes/floor/FloorPlanScreen.tsx').then((m) => ({ default: m.FloorPlanScreen }))
+)
+const KdsBoardScreen = lazy(() =>
+  import('./routes/kds/KdsBoardScreen.tsx').then((m) => ({ default: m.KdsBoardScreen }))
+)
 
 function Lazy({ children }: { children: ReactNode }): ReactNode {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>
@@ -60,6 +66,8 @@ export const router: RouterProviderProps['router'] = createBrowserRouter([
         { path: 'order', element: <Lazy><OrderScreen /></Lazy> },
         { path: 'pay/:orderId', element: <Lazy><PaymentScreen /></Lazy> },
         { path: 'shift', element: <Lazy><ShiftScreen /></Lazy> },
+        { path: 'floor', element: <Lazy><FloorPlanScreen /></Lazy> },
+        { path: 'kds', element: <Lazy><KdsBoardScreen /></Lazy> },
         { path: 'products', element: <Lazy><ProductsScreen /></Lazy> },
         { path: 'categories', element: <Lazy><CategoriesScreen /></Lazy> },
         { path: 'units', element: <Lazy><UnitsScreen /></Lazy> },

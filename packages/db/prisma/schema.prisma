@@ -68,6 +68,19 @@ model Tenant {
   shifts        Shift[]
   cashMovements CashMovement[]
 
+  // Sales method — S7
+  salesMethods SalesMethod[]
+
+  // Floor plan — S7
+  areas  Area[]
+  tables Table[]
+
+  // KDS — S7
+  stations Station[]
+
+  // Inventory & purchasing — S6
+  stockMovements StockMovement[]
+
   @@map("tenants")
 }
 
@@ -102,6 +115,12 @@ model Outlet {
   outboxEvents OutboxEvent[]
   orders       Order[]
   shifts       Shift[]
+  areas        Area[]
+  tables       Table[]
+  stations     Station[]
+
+  // Inventory & purchasing — S6
+  stockMovements StockMovement[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -427,14 +446,16 @@ model Category {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  tenant   Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
-  children Category[] @relation("CategoryTree")
-  products Product[]
+  tenant         Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent         Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children       Category[] @relation("CategoryTree")
+  products       Product[]
+  defaultStation Station?   @relation(fields: [defaultStationId], references: [id], onDelete: SetNull)
 
   @@unique([tenantId, slug])
   @@index([tenantId])
   @@index([parentId])
+  @@index([defaultStationId])
   @@map("categories")
 }
 
@@ -566,6 +587,10 @@ model ProductVariant {
   stockUnit  Unit?           @relation("VariantStockUnit", fields: [stockUnitId], references: [id], onDelete: Restrict)
   priceItems PriceListItem[]
   orderItems OrderItem[]
+
+  // Inventory & purchasing — S6. A variant is consumed (SALE_CONSUMPTION),
+  // received (PURCHASE), and used as a recipe component in these roles.
+  stockMovements StockMovement[]
 
   @@unique([tenantId, sku])
   // Barcode lookup is the retail scan path — must be unique per tenant to be
@@ -742,6 +767,171 @@ enum OrderChargeKind {
   GRATUITY
 }
 
+// ---------------------------------------------------------------------------
+// Sales method — S7-01 (design §6)
+// ---------------------------------------------------------------------------
+
+/// Design §6 — how the order is fulfilled. Tenant-owned config, referenced by
+/// `Order.salesMethod` / `PriceList.salesMethod` as a plain `code` string (not a
+/// FK), so a historical order keeps its method even if this row is renamed or
+/// deactivated — the same seam PriceList already uses.
+///
+/// The fiscal columns are nullable and NO-OP in S7 (standard #2 stays intact):
+/// tax and service charge still resolve from Outlet (+ Category.defaultTaxRateBp).
+/// They exist so a per-method override can be wired later without a migration;
+/// until then order.fiscal.ts is an identity passthrough.
+model SalesMethod {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  /// Stable identifier orders join on (e.g. "DINE_IN"). Unique per tenant.
+  code String
+  name String
+  kind SalesMethodKind
+
+  /// Reserved fiscal override (§6). Null = inherit the outlet's config. No-op in S7.
+  taxRateBp           Int?
+  serviceChargeRateBp Int?
+  taxInclusive        Boolean?
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, code])
+  @@index([tenantId])
+  @@map("sales_methods")
+}
+
+enum SalesMethodKind {
+  DINE_IN
+  TAKEAWAY
+  DELIVERY
+}
+
+// ---------------------------------------------------------------------------
+// Floor plan — S7-02 (design §5.4)
+// ---------------------------------------------------------------------------
+
+/// Design §5.4 — the layout hierarchy above tables. Self-referencing: a FLOOR
+/// row is a top-level area (parentId null); an AREA row is a section nested under
+/// a floor. Retail and service leave `features.tables` off and never create these.
+model Area {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  outletId String @db.Uuid
+  parentId String? @db.Uuid
+
+  kind      AreaKind
+  name      String
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet   Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  parent   Area?   @relation("AreaTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Area[]  @relation("AreaTree")
+  tables   Table[]
+
+  @@index([tenantId])
+  @@index([outletId])
+  @@index([parentId])
+  @@map("areas")
+}
+
+enum AreaKind {
+  AREA
+  FLOOR
+}
+
+/// Design §5.4 — a physical table. One table has at most one active order at a
+/// time; the partial unique index `orders_one_per_table` is the hard guard. The
+/// status is a small state machine (table.state.ts). `qrToken` is a random token
+/// for QR self-service ordering (§16.2), never a guessable table number.
+model Table {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @db.Uuid
+  outletId String  @db.Uuid
+  areaId   String? @db.Uuid
+
+  code     String
+  name     String
+  status   TableStatus @default(EMPTY)
+  capacity Int?
+  /// Random token for the QR order URL (§16.2). Unique globally.
+  qrToken  String
+  sortOrder Int    @default(0)
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet Outlet  @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  area   Area?   @relation(fields: [areaId], references: [id], onDelete: SetNull)
+  orders Order[]
+
+  @@unique([outletId, code])
+  @@unique([qrToken])
+  @@index([tenantId])
+  @@index([outletId])
+  @@index([areaId])
+  @@map("tables")
+}
+
+enum TableStatus {
+  EMPTY
+  OCCUPIED
+  RESERVED
+  DIRTY
+}
+
+/// Design §5.5 — a KDS prep station (kitchen, bar, dessert). An outlet owns its
+/// stations; a Category routes to one via `defaultStationId`, so a `MADE_TO_ORDER`
+/// item lands at the right screen when SENT. Retail/Service outlets simply leave
+/// `features.kds` off and never create stations. Pure config + mapping — no
+/// vertical branch (§5.5).
+model Station {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+  outletId String @db.Uuid
+
+  name      String
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet     Outlet      @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  categories Category[]
+  orderItems OrderItem[]
+
+  @@unique([outletId, name])
+  @@index([tenantId])
+  @@index([outletId])
+  @@map("stations")
+}
+
+/// Per-item KDS lane (§5.1). Null until the item is routed to a station at SENT;
+/// a non-MADE_TO_ORDER item (or a KDS-off outlet) stays null forever. VOID is the
+/// per-item cancel from `voidItem`.
+enum KdsStatus {
+  QUEUED
+  PREPARING
+  READY
+  SERVED
+  VOID
+}
+
 /// Design §6/§7 — "what was ordered". Bill (BILLED) and Payment (PAID) are
 /// separate levels arriving in S5; this model stops at the BILLED snapshot.
 model Order {
@@ -752,9 +942,14 @@ model Order {
   status  OrderStatus  @default(OPEN)
   channel OrderChannel @default(STAFF)
 
-  /// Plain string until SalesMethod arrives in S7; matches the PriceList seam
-  /// (price.service compares it case-sensitively).
+  /// References SalesMethod by `code` (a plain string, not a FK) — the PriceList
+  /// seam price.service compares case-sensitively. SalesMethod config landed in S7.
   salesMethod String?
+
+  /// The seated table (§5.4), when `features.tables` is on. Null for takeaway,
+  /// delivery, retail, and service. A partial unique index enforces one active
+  /// order per table (orders_one_per_table).
+  tableId String? @db.Uuid
 
   /// Standard #7 — item snapshots freeze at SENT; charges freeze at BILLED.
   sentAt   DateTime?
@@ -765,12 +960,14 @@ model Order {
 
   tenant  Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   outlet  Outlet        @relation(fields: [outletId], references: [id], onDelete: Restrict)
+  table   Table?        @relation(fields: [tableId], references: [id], onDelete: Restrict)
   items   OrderItem[]
   charges OrderCharge[]
   bills   Bill[]
 
   @@index([tenantId])
   @@index([outletId])
+  @@index([tableId])
   @@map("orders")
 }
 
@@ -794,17 +991,26 @@ model OrderItem {
   /// Frozen chosen-modifier list for the receipt (name + delta per modifier).
   modifiersSnapshot     Json?
 
+  /// KDS routing (§5.5), resolved at SENT. `stationId` is the station this line
+  /// was routed to (from its category's `defaultStationId`); `kdsStatus` is its
+  /// prep lane. Both null while OPEN and for items that never enter the KDS
+  /// (non-MADE_TO_ORDER, or a `features.kds`-off outlet).
+  stationId String?    @db.Uuid
+  kdsStatus KdsStatus?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   order   Order          @relation(fields: [orderId], references: [id], onDelete: Cascade)
   variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  station Station?       @relation(fields: [stationId], references: [id], onDelete: SetNull)
   charges OrderCharge[]
 
   @@index([tenantId])
   @@index([orderId])
   @@index([variantId])
+  @@index([stationId])
   @@map("order_items")
 }
 
@@ -1065,4 +1271,68 @@ enum CashMovementType {
   PAID_IN
   PAID_OUT
   DROP
+}
+
+// ---------------------------------------------------------------------------
+// Inventory & purchasing — S6 (design §4)
+//
+// Standard #3: stock is an append-only ledger. On-hand is SUM(StockMovement.qty)
+// for a variant at an outlet — there is deliberately no stockOnHand column
+// (race-updated balances were the root cause of drift in brewsync 1.0, §4).
+// An "ingredient" is not a separate entity: it is a ProductVariant in the
+// consumed role (ERD §17) — StockMovement and RecipeItem both point at it.
+// ---------------------------------------------------------------------------
+
+/// Design §4.1 — the ONLY way stock changes. Each change is one immutable row;
+/// on-hand = SUM(qty). `qty` is signed and in SCALED BASE UNITS (the variant's
+/// stock-unit base × UNIT_FACTOR_SCALE), so a fractional recipe amount (0.5 g,
+/// 30 ml) stays an exact integer through a deep recipe chain — the same
+/// float-free trick Unit.factor uses (§3.2). Positive = in, negative = out; the
+/// sign is authoritative, the `type` descriptive.
+model StockMovement {
+  id        String @id @default(uuid()) @db.Uuid
+  tenantId  String @db.Uuid
+  outletId  String @db.Uuid
+  variantId String @db.Uuid
+
+  type StockMovementType
+  /// Signed, scaled base units (see UNIT_FACTOR_SCALE in @brewsync/shared).
+  qty  BigInt
+
+  /// Minor units per ONE base unit (standard #2), for moving-average valuation
+  /// (§4.3): the real purchase cost on inbound, the moving-average snapshot on a
+  /// SALE_CONSUMPTION so historical COGS never shifts. Null when a movement only
+  /// corrects quantity (e.g. a stock-take that does not restate cost).
+  costPerUnit BigInt?
+
+  /// Origin of the movement — e.g. ('order', orderId), ('po', poId). Lets the
+  /// sale path stay idempotent (skip if a row already exists for this order).
+  refType String?
+  refId   String? @db.Uuid
+
+  /// Required for ADJUSTMENT / WASTE (§4.1): why stock left the automatic path.
+  reason String?
+
+  createdByUserId String?  @db.Uuid
+  createdAt       DateTime @default(now())
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet  Outlet         @relation(fields: [outletId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+
+  @@index([tenantId])
+  @@index([outletId, variantId])
+  @@index([refType, refId])
+  @@map("stock_movements")
+}
+
+/// Design §4.1 — what drove a stock change. The `qty` sign is authoritative; this
+/// is the descriptive classifier reports group by.
+enum StockMovementType {
+  PURCHASE
+  SALE_CONSUMPTION
+  WASTE
+  TRANSFER
+  ADJUSTMENT
+  PRODUCTION
 }

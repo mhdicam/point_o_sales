@@ -25,9 +25,15 @@ function useNavItems(): NavItem[] {
   const canProduct = usePermission(PERMISSIONS.PRODUCT_VIEW)
   const canPrice = usePermission(PERMISSIONS.PRICE_EDIT)
   const canShift = usePermission(PERMISSIONS.SHIFT_OPEN)
+  const canTable = usePermission(PERMISSIONS.TABLE_MANAGE)
+  const canKds = usePermission(PERMISSIONS.KDS_BUMP)
   const modifiersOn = useFeature('modifiers')
+  const tablesOn = useFeature('tables')
+  const kdsOn = useFeature('kds')
   return [
     { to: '/admin/order', label: 'Order', show: canOrder },
+    { to: '/admin/floor', label: 'Floor plan', show: canTable && tablesOn },
+    { to: '/admin/kds', label: 'Kitchen', show: canKds && kdsOn },
     { to: '/admin/shift', label: 'Shift', show: canShift },
     { to: '/admin/products', label: 'Products', show: canProduct },
     { to: '/admin/categories', label: 'Categories', show: canProduct },

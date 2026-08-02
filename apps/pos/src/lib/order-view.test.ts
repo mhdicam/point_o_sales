@@ -39,6 +39,7 @@ function order(over: Partial<Order> = {}): Order {
     status: 'OPEN',
     channel: 'STAFF',
     salesMethod: null,
+    tableId: null,
     sentAt: null,
     billedAt: null,
     createdAt: '2026-08-01T00:00:00.000Z',

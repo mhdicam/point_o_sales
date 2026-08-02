@@ -9,9 +9,16 @@
 export const EVENT_TYPES = {
   // Sales
   SALE_COMPLETED: 'SaleCompleted',
+  ORDER_SENT: 'OrderSent',
   ORDER_VOIDED: 'OrderVoided',
   ITEM_VOIDED: 'ItemVoided',
   REFUND_ISSUED: 'RefundIssued',
+  // Floor operations (§5.4)
+  ORDER_TRANSFERRED: 'OrderTransferred',
+  ORDER_MERGED: 'OrderMerged',
+  ITEMS_MOVED: 'ItemsMoved',
+  // Kitchen display (§5.5)
+  KDS_ITEM_UPDATED: 'KdsItemUpdated',
 
   // Inventory
   STOCK_ADJUSTED: 'StockAdjusted',

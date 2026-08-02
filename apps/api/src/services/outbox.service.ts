@@ -18,6 +18,21 @@ import type { Config } from '../config.js'
 export interface OutboxWorkerOptions {
   pollIntervalMs?: number
   batchSize?: number
+  /**
+   * Optional side-effect run for every event as it dispatches, before it is
+   * marked processed. The realtime hubs (S7-05) subscribe here to fan events to
+   * connected clients. Kept as a callback so the worker's core stays ignorant of
+   * who consumes — producers never know their consumers (standard #4).
+   */
+  onEvent?: (event: DispatchedEvent) => void
+}
+
+/** The shape handed to `onEvent` — the persisted outbox row, minus bookkeeping. */
+export interface DispatchedEvent {
+  id: string
+  type: string
+  outletId: string | null
+  payload: unknown
 }
 
 export class OutboxWorker {
@@ -87,7 +102,7 @@ export class OutboxWorker {
     }
   }
 
-  private async dispatch(event: { id: string; type: string; payload: unknown }): Promise<void> {
+  private async dispatch(event: DispatchedEvent): Promise<void> {
     try {
       // Idempotency: check if already processed elsewhere (concurrent worker, retry).
       const existing = await runUnscoped(() =>
@@ -102,9 +117,17 @@ export class OutboxWorker {
         return
       }
 
-      // Dispatch to the appropriate handler. Real handlers are registered in a
-      // map (not implemented here — that's post-MVP when events actually route
-      // somewhere). For now, just mark it dispatched and log.
+      // Fan to in-process consumers (realtime hubs, S7-05). Failure here must not
+      // wedge the outbox — a dropped realtime frame is recoverable (clients
+      // refetch), a stuck worker is not.
+      if (this.options.onEvent) {
+        try {
+          this.options.onEvent(event)
+        } catch (error) {
+          this.logger.error({ eventId: event.id, error }, 'Outbox onEvent handler failed')
+        }
+      }
+
       this.logger.info({ eventId: event.id, type: event.type }, 'Event dispatched')
 
       await runUnscoped(() =>
@@ -139,10 +162,16 @@ export class OutboxWorker {
   }
 }
 
-export function startOutboxWorker(db: BrewsyncClient, logger: Logger, config: Config): OutboxWorker {
+export function startOutboxWorker(
+  db: BrewsyncClient,
+  logger: Logger,
+  config: Config,
+  onEvent?: (event: DispatchedEvent) => void
+): OutboxWorker {
   const worker = new OutboxWorker(db, logger, {
     pollIntervalMs: config.OUTBOX_POLL_INTERVAL_MS,
     batchSize: config.OUTBOX_BATCH_SIZE,
+    ...(onEvent ? { onEvent } : {}),
   })
 
   worker.start()

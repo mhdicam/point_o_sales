@@ -11,7 +11,6 @@
  */
 
 import type { FulfillmentType } from '@brewsync/shared'
-
 // ---- Session / auth ----
 
 export interface AuthUser {
@@ -150,7 +149,109 @@ export interface PriceList {
   isActive: boolean
 }
 
+export type SalesMethodKind = 'DINE_IN' | 'TAKEAWAY' | 'DELIVERY'
+
+/**
+ * How an order is fulfilled (design §6). Orders reference it by `code`. The
+ * fiscal fields are reserved (no-op in S7) — tax/service charge still come from
+ * the outlet — so the FE never reads them for money.
+ */
+export interface SalesMethod {
+  id: string
+  code: string
+  name: string
+  kind: SalesMethodKind
+  taxRateBp: number | null
+  serviceChargeRateBp: number | null
+  taxInclusive: boolean | null
+  isActive: boolean
+  sortOrder: number
+}
+
+// ---- Floor plan (S7-02, design §5.4) ----
+
+export type AreaKind = 'AREA' | 'FLOOR'
+
+/** A node in the floor-plan hierarchy. FLOOR = top-level; AREA = nested section. */
+export interface Area {
+  id: string
+  outletId: string
+  parentId: string | null
+  kind: AreaKind
+  name: string
+  sortOrder: number
+  isActive: boolean
+}
+
+export type TableStatus = 'EMPTY' | 'OCCUPIED' | 'RESERVED' | 'DIRTY'
+
+/**
+ * A physical table. `status` is a small state machine (server-enforced). `qrToken`
+ * is the self-service order token (§16.2) — the FE only needs it to build a QR link,
+ * never to identify the table in the UI (that's `code`/`name`).
+ */
+export interface Table {
+  id: string
+  outletId: string
+  areaId: string | null
+  code: string
+  name: string
+  status: TableStatus
+  capacity: number | null
+  qrToken: string
+  sortOrder: number
+  isActive: boolean
+}
+
 // ---- Order (S4) ----
+
+// ---- KDS stations (S7-04, design §5.5) ----
+
+/**
+ * A kitchen prep station (Bar, Kitchen, …). Outlet-owned master data; a routed
+ * order line is grouped onto one at SENT. Only surfaces when `features.kds` is on.
+ */
+export interface Station {
+  id: string
+  outletId: string
+  name: string
+  sortOrder: number
+  isActive: boolean
+}
+
+// ---- KDS board (S7-04/05, design §5.5) ----
+
+export type KdsStatus = 'QUEUED' | 'PREPARING' | 'READY' | 'SERVED' | 'VOID'
+
+/** A frozen modifier on a KDS ticket line (subset of OrderItemModifier). */
+export interface KdsTicketModifier {
+  modifierId: string
+  name: string
+  priceDelta: string
+}
+
+/**
+ * One routed order line as the kitchen board sees it (design §5.5). The line
+ * *is* the ticket — there is no separate KDS table. `stationId` is null for an
+ * unrouted made-to-order line, surfaced on its own lane rather than dropped.
+ */
+export interface KdsTicket {
+  id: string
+  orderId: string
+  stationId: string | null
+  kdsStatus: KdsStatus
+  qty: number
+  nameSnapshot: string
+  modifiersSnapshot: KdsTicketModifier[] | null
+  createdAt: string
+  order: { channel: OrderChannel; tableId: string | null }
+}
+
+/** The board projection returned by GET /kds/board. */
+export interface KdsBoard {
+  stations: { id: string; name: string }[]
+  tickets: KdsTicket[]
+}
 
 export type OrderStatus = 'OPEN' | 'SENT' | 'SERVED' | 'BILLED' | 'PAID' | 'CLOSED' | 'VOID'
 
@@ -230,6 +331,8 @@ export interface Order {
   status: OrderStatus
   channel: OrderChannel
   salesMethod: string | null
+  /** Seated table (§5.4), when `features.tables` is on. Null for takeaway/delivery/retail/service. */
+  tableId: string | null
   sentAt: string | null
   billedAt: string | null
   createdAt: string

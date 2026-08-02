@@ -63,6 +63,15 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   // Shift — S5
   'Shift',
   'CashMovement',
+  // Sales method — S7
+  'SalesMethod',
+  // Floor plan — S7
+  'Area',
+  'Table',
+  // KDS — S7
+  'Station',
+  // Inventory & purchasing — S6
+  'StockMovement',
 ])
 
 /**

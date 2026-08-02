@@ -25,11 +25,12 @@ import { inputToMinor } from '../../lib/money-input.ts'
 import { useAuthStore } from '../../stores/auth.store.ts'
 import { useProductsStore } from '../../stores/products.store.ts'
 import { useOrdersStore } from '../../stores/orders.store.ts'
+import { useSalesMethodsStore } from '../../stores/sales-methods.store.ts'
 import type { DiscountPayload } from '../../stores/orders.store.ts'
 import { usePermission } from '../../hooks/usePermission.ts'
 import { useFeature } from '../../hooks/useFeature.ts'
 import type { ModifierGroup, ProductListItem } from '../../lib/types.ts'
-import { Button, ErrorBanner, Field, Input, Spinner } from '../../ui/primitives.tsx'
+import { Button, ErrorBanner, Field, Input, Select, Spinner } from '../../ui/primitives.tsx'
 import { Modal } from '../../ui/Modal.tsx'
 import { ProductGrid } from './ProductGrid.tsx'
 import { OrderPanel } from './OrderPanel.tsx'
@@ -113,6 +114,9 @@ export function OrderScreen(): ReactNode {
   const productsLoading = useProductsStore((s) => s.loading)
   const listProducts = useProductsStore((s) => s.list)
 
+  const salesMethods = useSalesMethodsStore((s) => s.items)
+  const listSalesMethods = useSalesMethodsStore((s) => s.list)
+
   const order = useOrdersStore((s) => s.current)
   const busy = useOrdersStore((s) => s.busy)
   const error = useOrdersStore((s) => s.error)
@@ -144,10 +148,14 @@ export function OrderScreen(): ReactNode {
   const [discountTarget, setDiscountTarget] = useState<DiscountTarget | null>(null)
   const [gratuityOpen, setGratuityOpen] = useState(false)
   const [pickError, setPickError] = useState<string | null>(null)
+  // The chosen method for a not-yet-created order. Once the order exists its
+  // method is fixed (order.salesMethod), so the picker reflects that instead.
+  const [salesMethod, setSalesMethod] = useState('')
 
   useEffect(() => {
     void listProducts()
-  }, [listProducts])
+    void listSalesMethods()
+  }, [listProducts, listSalesMethods])
 
   // Start each visit with a clean slate; a billed/closed order stays out of the way.
   useEffect(() => {
@@ -174,7 +182,7 @@ export function OrderScreen(): ReactNode {
         setPickError('Select an outlet for this session first.')
         return
       }
-      await create({ outletId })
+      await create({ outletId, ...(salesMethod !== '' ? { salesMethod } : {}) })
       if (!useOrdersStore.getState().current) return // create failed; error already set
     }
     await run()
@@ -240,6 +248,32 @@ export function OrderScreen(): ReactNode {
       <section className="flex min-h-0 flex-1 flex-col gap-3">
         <header className="flex items-center justify-between">
           <h1 className="text-lg font-semibold text-ink">New order</h1>
+          {salesMethods.length > 0 ? (
+            order ? (
+              // The method is fixed once the order exists; show it, don't offer a change.
+              <span className="text-sm text-ink-muted">
+                {salesMethods.find((m) => m.code === order.salesMethod)?.name ??
+                  order.salesMethod ??
+                  'No method'}
+              </span>
+            ) : (
+              <label className="flex items-center gap-2 text-sm text-ink-muted">
+                Method
+                <Select
+                  value={salesMethod}
+                  onChange={(e) => setSalesMethod(e.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">Default</option>
+                  {salesMethods.map((m) => (
+                    <option key={m.id} value={m.code}>
+                      {m.name}
+                    </option>
+                  ))}
+                </Select>
+              </label>
+            )
+          ) : null}
         </header>
         {pickError ? <ErrorBanner message={pickError} /> : null}
         {productsLoading && products.length === 0 ? (

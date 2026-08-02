@@ -16,6 +16,7 @@ import type { BrewsyncClient } from '@brewsync/db'
 import { PERMISSIONS } from '@brewsync/shared'
 import { OrderService } from '../services/order.service.js'
 import { createPermissionMiddleware } from '../middleware/permission.middleware.js'
+import { createFeatureMiddleware } from '../middleware/feature.middleware.js'
 import { badRequest } from '../http-error.js'
 import { minorUnits } from '../zod-bigint.js'
 
@@ -55,6 +56,20 @@ const gratuitySchema = z.object({
   gratuityMinor: minorUnits,
 })
 
+/** Floor operations (§5.4) — transfer a table, merge two orders, move items. */
+const transferSchema = z.object({
+  targetTableId: z.string().uuid(),
+})
+
+const mergeSchema = z.object({
+  absorbedOrderId: z.string().uuid(),
+})
+
+const moveItemsSchema = z.object({
+  toOrderId: z.string().uuid(),
+  orderItemIds: z.array(z.string().uuid()).min(1),
+})
+
 const statusSchema = z.enum(['OPEN', 'SENT', 'SERVED', 'BILLED', 'PAID', 'CLOSED', 'VOID'])
 
 function parseId(raw: unknown, what: string): string {
@@ -69,6 +84,7 @@ export function createOrderRouter(db: BrewsyncClient): Router {
   const router = Router()
   const orders = new OrderService(db)
   const requirePermission = createPermissionMiddleware(db)
+  const requireFeature = createFeatureMiddleware(db)
 
   // ---- Reads ----
 
@@ -274,6 +290,72 @@ export function createOrderRouter(db: BrewsyncClient): Router {
           parseId(req.params['itemId'], 'Order item id')
         )
         res.json({ order })
+      } catch (error) {
+        next(error)
+      }
+    }
+  )
+
+  // ---- Floor operations (§5.4) — gated by the `tables` feature ----
+
+  router.post(
+    '/:id/transfer',
+    requireFeature('tables'),
+    requirePermission(PERMISSIONS.ORDER_TRANSFER),
+    async (req, res, next) => {
+      try {
+        const parsed = transferSchema.safeParse(req.body)
+        if (!parsed.success) {
+          throw badRequest('VALIDATION_ERROR', 'Invalid transfer', parsed.error.issues)
+        }
+        const order = await orders.transfer(
+          parseId(req.params['id'], 'Order id'),
+          parsed.data.targetTableId
+        )
+        res.json({ order })
+      } catch (error) {
+        next(error)
+      }
+    }
+  )
+
+  router.post(
+    '/:id/merge',
+    requireFeature('tables'),
+    requirePermission(PERMISSIONS.ORDER_TRANSFER),
+    async (req, res, next) => {
+      try {
+        const parsed = mergeSchema.safeParse(req.body)
+        if (!parsed.success) {
+          throw badRequest('VALIDATION_ERROR', 'Invalid merge', parsed.error.issues)
+        }
+        const result = await orders.merge(
+          parseId(req.params['id'], 'Order id'),
+          parsed.data.absorbedOrderId
+        )
+        res.json(result)
+      } catch (error) {
+        next(error)
+      }
+    }
+  )
+
+  router.post(
+    '/:id/move-items',
+    requireFeature('tables'),
+    requirePermission(PERMISSIONS.ORDER_TRANSFER),
+    async (req, res, next) => {
+      try {
+        const parsed = moveItemsSchema.safeParse(req.body)
+        if (!parsed.success) {
+          throw badRequest('VALIDATION_ERROR', 'Invalid move', parsed.error.issues)
+        }
+        const result = await orders.moveItems(
+          parseId(req.params['id'], 'Order id'),
+          parsed.data.toOrderId,
+          parsed.data.orderItemIds
+        )
+        res.json(result)
       } catch (error) {
         next(error)
       }
