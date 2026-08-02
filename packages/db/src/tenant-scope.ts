@@ -79,6 +79,9 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'PurchaseOrderItem',
   // Reservation — S8
   'Reservation',
+  // Landing page — S9
+  'LandingPage',
+  'LandingSection',
 ])
 
 /**

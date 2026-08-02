@@ -67,16 +67,19 @@ model LandingPage {
 }
 
 model LandingSection {
-  id            String             @id @default(uuid())
-  landingPageId String
+  id            String             @id @default(uuid()) @db.Uuid
+  tenantId      String             @db.Uuid   // self-scoped like every child table
+  landingPageId String             @db.Uuid
   type          LandingSectionType
   position      Int                @default(0)  // admin drag-order, unique per page
   title         String?            // admin-facing label
   content       Json               // per-type content (hero/catalog/hours/...)
   isVisible     Boolean            @default(true)
+  tenant        Tenant             @relation(fields: [tenantId], references: [id])
   landingPage   LandingPage        @relation(fields: [landingPageId], references: [id])
 
   @@unique([landingPageId, position])
+  @@index([tenantId])
   @@index([landingPageId])
 }
 
@@ -92,7 +95,10 @@ Rationale:
 - **position unique per page** — DB-enforced drag-order.
 - **content Json per type** — heterogeneous sections; each type gets one renderer + one Zod schema.
 - **tenantId never written manually** — Prisma extension + RLS (standard #1). slug resolved
-  unscoped like qrToken, then binds to resolved tenant.
+  unscoped like qrToken, then binds to resolved tenant. `landing_sections` is **self-scoped**
+  (own `tenantId`, standard policy) like every other child table — the tenant-scope extension
+  needs the GUC bound on direct section queries, and the RLS_TABLES ↔ TENANT_SCOPED_MODELS
+  invariant requires it.
 - No version/history table (not required by §17.1).
 
 Migration `20260804xxxx00_s8_landing_page`: 2 CREATE TABLE + 2 CREATE TYPE + RLS DO-block

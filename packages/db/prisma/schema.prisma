@@ -95,6 +95,10 @@ model Tenant {
   // Reservation — S8-01
   reservations Reservation[]
 
+  // Landing page — S9-01
+  landingPages    LandingPage[]
+  landingSections LandingSection[]
+
   @@map("tenants")
 }
 
@@ -143,6 +147,9 @@ model Outlet {
 
   // Reservation — S8-01
   reservations Reservation[]
+
+  // Landing page — S9-01 (per-outlet page, optional)
+  landingPages LandingPage[]
 
   @@unique([tenantId, code])
   @@index([tenantId])
@@ -1651,4 +1658,99 @@ model Reservation {
   @@index([tableId, status])
   @@index([assignedStaffId, status])
   @@map("reservations")
+}
+
+// Landing page & CMS — S9-01 (design §17)
+
+/// A tenant's public landing page (`features.landingPage`). Section-based
+/// content the admin edits from the dashboard (§17.1) — one page per tenant (or
+/// per outlet). The PUBLIC endpoint only ever serves the `PUBLISHED` version;
+/// edits happen on the draft, so half-finished content never leaks. `slug` is
+/// resolved unscoped (like `Table.qrToken`) then everything binds to the
+/// resolved tenant — no client string ever selects a tenant (standard #1).
+model LandingPage {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @db.Uuid
+
+  /// Null = a per-tenant page; set = a per-outlet page (§17.1).
+  outletId String? @db.Uuid
+
+  /// Public path segment (`/p/:slug`). Unique per tenant. No subdomain — the
+  /// page is served on the shared host by path, like the QR token route.
+  slug        String
+  title       String
+  description String?
+
+  /// Brand theme (warna, font, logo) as JSON — applied as CSS variables by the
+  /// public renderer. Kept opaque here; shape validated at the API boundary.
+  theme Json?
+
+  /// Mirrors `features.onlineOrder` for THIS page (§17.1): true = the catalog
+  /// can check out (channel=ONLINE, §16.3); false = catalog-only showcase. The
+  /// `onlineOrder` feature flag stays the master kill-switch enforced in the
+  /// service; this is the per-page preference the admin publishes.
+  orderingEnabled Boolean @default(false)
+
+  status      LandingPageStatus @default(DRAFT)
+  publishedAt DateTime?
+
+  updatedBy String?  @db.Uuid
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  outlet   Outlet?          @relation(fields: [outletId], references: [id], onDelete: SetNull)
+  sections LandingSection[]
+
+  @@unique([tenantId, slug])
+  @@index([tenantId])
+  @@index([outletId])
+  @@map("landing_pages")
+}
+
+/// One content block on a landing page (§17.1). Heterogeneous by `type`; each
+/// type has one renderer + one Zod content schema at the API boundary. `content`
+/// is JSON shaped per type (hero headline+CTA, catalog category/product picks,
+/// hours rows, …). `position` is admin-ordered and unique per page.
+model LandingSection {
+  id            String @id @default(uuid()) @db.Uuid
+  tenantId      String @db.Uuid
+  landingPageId String @db.Uuid
+
+  type     LandingSectionType
+  position Int                @default(0)
+
+  /// Admin-facing label for the section list (not necessarily shown publicly).
+  title String?
+
+  /// Per-`type` content. For CATALOG: `{ categoryIds?, productIds? }` — the
+  /// admin's live selection from master (§3); prices/availability are resolved
+  /// from master at request time, never copied here (§17.1 "gak ada menu basi").
+  content Json
+
+  isVisible Boolean @default(true)
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  landingPage LandingPage @relation(fields: [landingPageId], references: [id], onDelete: Cascade)
+
+  @@unique([landingPageId, position])
+  @@index([tenantId])
+  @@index([landingPageId])
+  @@map("landing_sections")
+}
+
+enum LandingSectionType {
+  HERO
+  CATALOG
+  ABOUT
+  GALLERY
+  CONTACT
+  HOURS
+  MAP
+  CUSTOM
+}
+
+enum LandingPageStatus {
+  DRAFT
+  PUBLISHED
 }
