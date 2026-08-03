@@ -24,9 +24,11 @@ Status: draft · 2026-07-31
 13. [Sprint 7 — Meja, KDS, sales method](#13-sprint-7--meja-kds-sales-method)
 14. [Sprint 8 — Reservasi + channel order (QR/online)](#14-sprint-8--reservasi--channel-order-qronline)
 15. [Sprint 9 — Landing page + CMS + katalog](#15-sprint-9--landing-page--cms--katalog)
-16. [Sprint 10 — Cetak, export, laporan](#16-sprint-10--cetak-export-laporan)
-17. [Cross-cutting: testing, CI/CD, observability](#17-cross-cutting-testing-cicd-observability)
-18. [Estimasi & prioritas](#18-estimasi--prioritas)
+16. [Sprint 10 — Cetak, export, laporan + manajemen diskon](#16-sprint-10--cetak-export-laporan--manajemen-diskon)
+17. [Sprint 11 — HR: karyawan, absensi, payroll](#16b-sprint-11--hr-karyawan-absensi-payroll)
+18. [Sprint 12 — Accounting: CoA + auto-journal](#16c-sprint-12--accounting-chart-of-accounts--auto-journal)
+19. [Cross-cutting: testing, CI/CD, observability](#17-cross-cutting-testing-cicd-observability)
+20. [Estimasi & prioritas](#18-estimasi--prioritas)
 
 ---
 
@@ -117,9 +119,11 @@ Ini penjabaran "Prinsip yang wajib dipegang" (design doc §11) jadi aturan konkr
 | **S7** | Meja, KDS, sales method | operasional lantai F&B | §5.3–5.6 |
 | **S8** | Reservasi + channel order (QR/online) | booking + order self-service | §15, §16 |
 | **S9** | Landing page + CMS + katalog motion | etalase publik + take-order | §17 |
-| **S10** | Cetak, export PDF/Excel, laporan | struk, laporan, rekap | §8, §18 |
+| **S10** | Cetak, export PDF/Excel, laporan + manajemen diskon | struk, laporan, rekap, promo | §8, §18, §6.5 |
+| **S11** | HR: karyawan, absensi, payroll | kelola SDM + biaya gaji ke Accounting | §20 |
+| **S12** | Accounting: CoA + auto-journal | pembukuan otomatis lintas modul | §21 |
 
-> **MVP jualan paling cepat** = S0–S5 + S7 (POS F&B dine-in yang bisa transaksi & tutup kas). S6 & S10 nyusul buat operasional penuh. S8–S9 fitur diferensiasi.
+> **MVP jualan paling cepat** = S0–S5 + S7 (POS F&B dine-in yang bisa transaksi & tutup kas). S6 & S10 nyusul buat operasional penuh. S8–S9 fitur diferensiasi. **S11 (HR) & S12 (Accounting)** = modul back-office; jalanin setelah POS stabil, karena keduanya nyandar ke event outbox yang dipancarin modul-modul sebelumnya.
 
 ---
 
@@ -220,9 +224,11 @@ Ini penjabaran "Prinsip yang wajib dipegang" (design doc §11) jadi aturan konkr
 | S4-03 | Snapshot harga saat SENT | Beku `priceSnapshot`, `nameSnapshot`, modifier delta. |
 | S4-04 | **Bill pipeline (§6 design)** | Urutan fixed: subtotal → diskon (item→order) → service charge → pajak → rounding (sekali) → total → gratuity. Tiap komponen jadi `OrderCharge`. |
 | S4-05 | Inclusive vs exclusive tax | Config per outlet/sales method. Extract net kalau inclusive. |
-| S4-06 | Diskon item & order | Persen/nominal, jadi `OrderCharge kind=DISCOUNT` (amount negatif). |
+| S4-06 | Diskon item & order (penerapan) | Persen/nominal, jadi `OrderCharge kind=DISCOUNT` (amount negatif). Ini *penerapan* di pipeline (§6.4). |
 | S4-07 | **Test pipeline** | Test angka: kombinasi diskon+SC+pajak inclusive/exclusive, rounding sekali. Ini test krusial — bug halus duit ada di sini. |
 | S4-08 | UI order (kasir) | Grid produk + panel order, responsive tablet. Tambah item cepat, lihat running total. |
+
+> **Note:** task manajemen diskon (DiscountRule + resolver + otorisasi) yang tadinya S4-07..S4-09 **dipindah ke Sprint 10** (jadi S10-10..S10-13). Scope-nya ditambahkan belakangan, dan tim yang udah lewat S4 gak perlu balik. Dependency aman: pipeline S4 udah beres, manajemen diskon cuma nambahin *sumber* diskonnya.
 
 **Acceptance criteria:**
 - Order jalan tembus state machine; transisi ilegal ketolak.
@@ -340,9 +346,9 @@ Ini penjabaran "Prinsip yang wajib dipegang" (design doc §11) jadi aturan konkr
 
 ---
 
-## 16. Sprint 10 — Cetak, export, laporan
+## 16. Sprint 10 — Cetak, export, laporan + manajemen diskon
 
-**Goal:** struk/dokumen tercetak, laporan bisa diekspor PDF/Excel, semua konsisten dari data yang sama.
+**Goal:** struk/dokumen tercetak, laporan bisa diekspor PDF/Excel, semua konsisten dari data yang sama. Plus: kelola promo/diskon (DiscountRule) yang ngelewatin pipeline S4.
 
 | ID | Task | Detail teknis |
 |---|---|---|
@@ -355,11 +361,67 @@ Ini penjabaran "Prinsip yang wajib dipegang" (design doc §11) jadi aturan konkr
 | S10-07 | Export PDF | Laporan & dokumen (pakai skill `pdf`). Header/footer brand. |
 | S10-08 | Export Excel/CSV | Rekap transaksi, mutasi stok, PO, pajak (pakai skill `xlsx`). Tipe kolom bener. |
 | S10-09 | Guard permission export | `report.view` / `report.export`. Endpoint nolak tanpa izin. |
+| S10-10 | **DiscountRule (manajemen promo)** | Model `DiscountRule` (method, scope ITEM/CATEGORY/ORDER, minSubtotal, validFrom/To, activeDays/Hours, salesMethodScope, memberOnly, stackable, quota, requiresApproval). CRUD + toggle `isActive`. Permission `discount.manage`. (§6.5.1) |
+| S10-11 | **Discount (catatan pakai) + resolver** | Model `Discount` append-only (source RULE/MANUAL, amountApplied negatif, appliedBy/approvedBy). Resolver: rule berlaku → validasi (waktu, minSubtotal, quota, member, stacking) di BE → jadi `OrderCharge DISCOUNT`. (§6.5.2) |
+| S10-12 | Diskon manual + otorisasi | Kasir/supervisor input diskon manual, dijaga `discount.override`; yang lewat ambang minta `discount.approve`. Semua kecatat di `Discount`. Test dua sisi permission. (§6.5.3) |
+| S10-13 | UI manajemen diskon (admin) | CRUD promo, toggle aktif, lihat pemakaian & kuota, riwayat diskon per order. Responsive. |
 
 **Acceptance criteria:**
 - Struk cetak = angka di layar = angka laporan (konsisten by design).
 - Export PDF & Excel dari periode sama gak beda angka.
 - Laporan finansial kebatasi permission (test).
+- DiscountRule bisa dibuat/diaktifkan; rule kedaluwarsa/kuota habis/di luar jam ketolak backend (test).
+- Diskon manual dijaga permission dua sisi; tiap diskon (rule/manual) kecatat di `Discount` (siapa, kenapa, berapa).
+
+---
+
+## 16b. Sprint 11 — HR (karyawan, absensi, payroll)
+
+**Goal:** kelola karyawan, jam kerja/absensi, dan payroll — dengan biaya gaji ngalir ke Accounting lewat event (bukan panggil langsung). Nyambung ke `TenantMembership`/`User` yang udah ada; jangan bikin identitas ganda.
+
+> Design ref: **design doc §20** (HR). Karyawan = perpanjangan `TenantMembership` (§13); absensi dari data Shift (§14) kalau ada, atau clock-in mandiri. Biaya gaji ngalir ke Accounting lewat event (§8).
+
+| ID | Task | Detail teknis |
+|---|---|---|
+| S11-01 | Employee (profil kepegawaian) | Extend `TenantMembership`/`User`: `Employee` (jabatan, tipe kontrak, tanggal masuk, outlet default, `baseSalary`/`hourlyRate`, rekening). Bukan tabel user baru — link ke identitas eksisting. |
+| S11-02 | Attendance / clock-in | `AttendanceRecord` append-only (clockIn/Out, sumber SHIFT/MANUAL/DEVICE). Kalau `features.tables`/shift aktif, tarik dari `Shift`; kalau enggak, clock-in mandiri. Hitung jam kerja & lembur. |
+| S11-03 | Leave & absence | `LeaveRequest` (tipe cuti, state REQUESTED→APPROVED/REJECTED). Permission `hr.approve`. Saldo cuti = ledger, bukan kolom di-update. |
+| S11-04 | PayrollPeriod + komponen | `PayrollPeriod` (rentang), `PayrollComponent` (earning/deduction: gaji pokok, tunjangan, lembur, potongan, pajak PPh21, BPJS). Data-driven biar fleksibel antar tenant. |
+| S11-05 | **Payroll run (state machine)** | DRAFT→CALCULATED→APPROVED→PAID. Hitung dari attendance + komponen. Snapshot angka saat APPROVED (gak berubah kalau master gaji di-edit). Permission `payroll.run`. |
+| S11-06 | **Event biaya gaji → Accounting** | Saat payroll APPROVED/PAID → emit `PayrollApproved`/`SalaryPaid` ke outbox (beban gaji + utang gaji / kas). Accounting yang jurnal, HR gak nyentuh ledger akuntansi. |
+| S11-07 | Slip gaji (cetak/PDF) | Slip per karyawan dari snapshot payroll (pakai skill `pdf`). Kebatasi permission (karyawan lihat punyanya sendiri). |
+| S11-08 | UI HR | Daftar karyawan, approve cuti, jalanin payroll (lihat rincian sebelum approve), responsive. |
+
+**Acceptance criteria:**
+- Karyawan = identitas yang sama dengan user POS (gak ada double-entry).
+- Payroll ngitung dari attendance + komponen; angka beku saat APPROVED (test snapshot).
+- Approve/PAID payroll emit event; Accounting nerima & jurnal (test end-to-end via outbox).
+- Slip gaji kebatasi permission (test).
+
+---
+
+## 16c. Sprint 12 — Accounting (chart of accounts + auto-journal)
+
+**Goal:** pembukuan otomatis dari aktivitas operasional. Accounting **cuma** konsumen event outbox — POS/HR/Inventory gak pernah manggil Accounting langsung. Jurnal double-entry, buku besar append-only, laporan keuangan diturunkan.
+
+> Design ref: **design doc §21** (Accounting) + §8 (event/outbox) + §11 (ledger append-only). Ini yang bikin "laporan lintas modul gampang" — pain point utama rebuild.
+
+| ID | Task | Detail teknis |
+|---|---|---|
+| S12-01 | Chart of Accounts | `Account` (kode, nama, tipe ASSET/LIABILITY/EQUITY/REVENUE/EXPENSE, parent). Seed CoA default per `BusinessProfile`; boleh di-custom per tenant. |
+| S12-02 | Journal + JournalLine (double-entry) | `JournalEntry` + `JournalLine` (debit/credit, append-only). **Invariant `SUM(debit) === SUM(credit)`** dijaga & diuji. Saldo akun = `SUM` line, bukan kolom. |
+| S12-03 | **Posting rules (event → jurnal)** | Consumer idempotent per event: `SaleCompleted` (kas/piutang, pendapatan, pajak keluaran, HPP+persediaan), `ShiftClosed` (rekonsiliasi kas), `GoodsReceived` (persediaan + utang), `RefundIssued`, `StockAdjusted`, `PayrollApproved`/`SalaryPaid`. Mapping event→akun data-driven per tenant. |
+| S12-04 | Idempotensi & mapping | Simpan `processedEventId` (unique) biar event dobel gak dobel-jurnal. Mapping akun bisa diatur admin (mis. akun pendapatan per kategori). |
+| S12-05 | Utang usaha (AP) + jatuh tempo | Dari `GoodsReceived` + `supplier.paymentTermDays` → jadwal jatuh tempo. Pelunasan supplier = jurnal + kurangi utang. |
+| S12-06 | Tutup buku (period close) | State periode OPEN→CLOSED; setelah CLOSED gak nerima jurnal mundur (koreksi = jurnal balik di periode berjalan). Permission `accounting.close`. Posting manual jurnal penyesuaian dijaga `journal.post`. |
+| S12-07 | Laporan keuangan | Neraca, Laba-Rugi, Arus Kas, Buku Besar, Neraca Saldo — diturunkan dari JournalLine. Export PDF/Excel (skill `pdf`/`xlsx`). Kebatasi permission. |
+| S12-08 | UI Accounting | Lihat CoA, jurnal (auto & manual), laporan per periode, status tutup buku. Read-heavy, responsive. |
+
+**Acceptance criteria:**
+- Tiap event operasional (jual, tutup shift, terima barang, payroll) auto-jadi jurnal seimbang; event dobel gak dobel-post (test idempotensi).
+- `SUM(debit) === SUM(credit)` di tiap entry (invariant teruji).
+- Laba-Rugi & Neraca konsisten dengan data operasional periode yang sama (test rekonsiliasi).
+- Periode CLOSED nolak jurnal mundur; koreksi lewat jurnal balik (test).
 
 ---
 
@@ -403,8 +465,10 @@ Ini jalan **paralel** di semua sprint, bukan sprint tersendiri.
 ### 18.2 Prioritas (MoSCoW buat MVP jualan)
 - **Must** — S0, S1, S2, S3, S4, S5, S7 (POS F&B dine-in transaksi + tutup kas).
 - **Should** — S6 (inventory/HPP), S10 (struk & laporan dasar).
-- **Could** — S8 (reservasi/QR/online), S9 (landing/CMS).
-- **Won't (belum)** — modul HR & Accounting penuh, billing/subscription SaaS, KDS multi-printer lanjutan. Ada di doc terpisah.
+- **Could** — S8 (reservasi/QR/online), S9 (landing/CMS), S11 (HR/payroll), S12 (Accounting/auto-journal). Back-office; jalanin setelah POS stabil.
+- **Won't (belum)** — billing/subscription SaaS (paket langganan tenant), KDS multi-printer lanjutan, integrasi bank/e-faktur pajak otomatis. Ada di doc terpisah nanti.
+
+> Catatan urutan: S11 (HR) & S12 (Accounting) nyandar ke event outbox dari S4/S5/S6 (SaleCompleted, ShiftClosed, GoodsReceived, dst) + `PayrollApproved` dari S11. Jadi walau prioritasnya "Could", **dependency-nya** minta S4–S6 udah beres dulu — jangan mulai Accounting sebelum event-event itu dipancarin & teruji.
 
 ### 18.3 Rambu biar sesuai ekspektasi
 - **Demo tiap akhir sprint pakai yang jalan**, bukan slide. Kalau gak bisa didemo, berarti belum done.

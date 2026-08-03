@@ -360,9 +360,67 @@ Dua mode, disimpan per outlet / per sales method:
 
 Karena mode ini konfigurasi, core-nya sama — cuma beda cara nurunin base. Pembulatan tetap sekali di langkah 5.
 
-### 6.4 Diskon
+### 6.4 Diskon saat order (penerapan)
 
-Diskon bisa item-level (satu item) atau order-level (seluruh bill), berbasis persen atau nominal. Item-level diterapkan dulu (mempengaruhi subtotal), baru order-level. Semua jadi baris `OrderCharge kind=DISCOUNT` dengan `amount` negatif — jejak jelas siapa diskon apa.
+Diskon bisa item-level (satu item) atau order-level (seluruh bill), berbasis persen atau nominal. Item-level diterapkan dulu (mempengaruhi subtotal), baru order-level. Semua jadi baris `OrderCharge kind=DISCOUNT` dengan `amount` negatif — jejak jelas siapa diskon apa. **Penerapan** diskon di pipeline gak berubah; yang di §6.5 itu **manajemen**-nya (dari mana diskon itu boleh datang).
+
+### 6.5 Manajemen diskon (DiscountRule)
+
+Diskon bukan cuma angka yang diketik kasir seenaknya. Ada dua asal diskon: **manual** (kasir/supervisor input, dijaga permission) dan **rule terkelola** (`DiscountRule` — promo yang didefinisikan admin sekali, dipakai berulang). Ini yang bikin diskon terkontrol & bisa dilaporkan, bukan bocor liar.
+
+#### 6.5.1 DiscountRule — promo terdefinisi
+
+```
+DiscountRule {
+  id, tenantId, outletId?      // null = berlaku semua outlet
+  name                          // "Promo Kemerdekaan 17%"
+  code?                         // kode voucher (null = auto-apply tanpa kode)
+  method                        // PERCENT | NOMINAL
+  value                         // 17 (persen) atau 17000 (minor unit)
+  scope                         // ITEM | CATEGORY | ORDER
+  targetCategoryId?             // kalau scope CATEGORY
+  targetVariantId?              // kalau scope ITEM
+  maxDiscountAmount?            // cap buat diskon persen (biar gak kebablasan)
+  minSubtotal?                  // syarat minimum belanja
+  validFrom?, validTo?          // window tanggal
+  activeDays?, activeHours?     // mis. happy hour Senin–Jumat 15–17
+  salesMethodScope?             // cuma dine-in / takeaway / dst
+  memberOnly                    // cuma buat member (nyambung loyalty)
+  stackable                     // boleh digabung diskon lain atau nggak
+  quota?                        // batas total pemakaian
+  quotaUsed                     // counter append-only (turunan dari Discount)
+  requiresApproval              // diskon "besar" perlu otorisasi
+  isActive
+  createdAt, createdBy
+}
+```
+
+#### 6.5.2 Discount — catatan pemakaian (append-only)
+
+Tiap kali rule dipakai atau diskon manual diberikan, tercatat satu baris `Discount` yang nyambung ke order + jadi sumber `OrderCharge kind=DISCOUNT`. Ini yang bikin kuota, laporan promo, dan audit "siapa ngasih diskon apa" akurat.
+
+```
+Discount {
+  id, tenantId, orderId
+  ruleId?           // null = diskon manual (bukan dari rule)
+  source            // RULE | MANUAL
+  method, value, scope
+  amountApplied     // minor unit, negatif — yang masuk OrderCharge
+  appliedBy         // user (buat audit)
+  approvedBy?       // kalau requiresApproval
+  reason?           // wajib buat diskon manual
+  createdAt
+}
+```
+
+#### 6.5.3 Aturan main
+
+- **Manual dijaga permission.** Kasir biasa mungkin cuma boleh diskon ≤ 10%; di atas itu butuh `discount.override` (supervisor). Diskon dari rule yang `requiresApproval` juga minta `discount.approve`. Guard di backend (§12), bukan cuma sembunyiin tombol.
+- **Validasi rule di backend.** `minSubtotal`, window tanggal/jam, `salesMethodScope`, `memberOnly`, `quota` — semua dicek server saat apply. Rule yang gak memenuhi syarat ditolak, gak peduli UI ngirim apa.
+- **Stacking terkontrol.** Kalau ada rule `stackable = false`, dia gak bisa digabung diskon lain. Resolver diskon mutusin kombinasi valid sebelum masuk pipeline §6.1 langkah 2.
+- **Cap buat persen.** `maxDiscountAmount` nahan diskon persen di nominal tertentu (mis. "20% maks 50rb").
+- **Tetap lewat pipeline.** Berapapun & dari manapun asalnya, hasil akhir selalu jadi `OrderCharge kind=DISCOUNT` (negatif) di langkah 2 pipeline — jadi perhitungan pajak/SC/rounding gak berubah. Manajemen diskon nambah *dari mana* diskonnya, bukan *bagaimana* dihitung.
+- **Laporan & event.** Agregasi `Discount` per rule = laporan efektivitas promo. Diskon ikut ke-snapshot di `SaleCompleted` biar Accounting bisa catat sebagai pengurang pendapatan / beban promo.
 
 ## 7. Pembayaran & split bill
 
@@ -414,8 +472,13 @@ POS gak pernah manggil Accounting atau modul lain langsung (prinsip #5). Dia cum
 | `ItemVoided` | item di-VOID | orderId, itemId, alasan | Inventory (balikin stok kalau sudah kepotong), audit |
 | `RefundIssued` | payment refund | billId, amount, alasan | Accounting (jurnal refund), Inventory |
 | `StockAdjusted` | StockMovement non-sale | itemId, qty, type | Accounting (nilai persediaan), report |
+| `GoodsReceived` | terima barang PO | poId, items, cost, supplierId | Accounting (persediaan + utang usaha) |
 | `ShiftOpened` | buka shift/kasir | shiftId, outletId, kas awal | Cash reconciliation |
 | `ShiftClosed` | tutup shift | shiftId, kas akhir, selisih | Accounting (setoran kas), report |
+| `PayrollApproved` | payroll → APPROVED | periodId, per-karyawan earning/deduction | Accounting (beban gaji + utang gaji) |
+| `SalaryPaid` | payroll → PAID | periodId, amount, akun kas/bank | Accounting (lunasi utang gaji) |
+
+> `GoodsReceived` dipancarin Inventory (§4), `PayrollApproved`/`SalaryPaid` dipancarin HR (§20) — pola-nya sama persis: producer emit ke outbox, Accounting (§21) yang jurnal. POS bukan satu-satunya producer; prinsip #5 berlaku buat semua modul.
 
 ### 8.2 Bentuk event & idempoten
 
@@ -483,6 +546,7 @@ Pengelompokan:
 - **Master produk:** Category, Product, ProductVariant, ModifierGroup, Modifier, Unit, PriceList, PriceListItem, Recipe, RecipeItem.
 - **Inventory & purchasing:** StockMovement, Supplier, PurchaseOrder, PurchaseOrderItem.
 - **Transaksi:** SalesMethod, Table, Station, Order, OrderItem, OrderCharge, Bill, Payment, PaymentMethod.
+- **Diskon:** DiscountRule, Discount.
 - **Kas & shift:** Shift, CashMovement.
 - **Reservasi & channel publik:** Reservation, LandingPage, LandingSection.
 - **Integrasi:** OutboxEvent.
@@ -533,6 +597,12 @@ erDiagram
     Order ||--o{ Bill : "dibagi jadi"
     Bill ||--o{ Payment : "dibayar via"
     PaymentMethod ||--o{ Payment : "tender"
+
+    Tenant ||--o{ DiscountRule : "punya"
+    Outlet ||--o{ DiscountRule : "scope (opsional)"
+    DiscountRule ||--o{ Discount : "dipakai"
+    Order ||--o{ Discount : "diskon order"
+    Discount ||--o| OrderCharge : "jadi baris DISCOUNT"
 
     Outlet ||--o{ OutboxEvent : "emit"
     Order ||--o{ OutboxEvent : "sumber event"
@@ -607,7 +677,7 @@ Role (kumpulan permission — bisa preset ATAU custom bikinan tenant)
 UserRole (assignment: user + role + scope outlet)
 ```
 
-- **Permission** — unit izin terkecil, **didefinisikan oleh sistem** (bukan tenant), format `domain.action`. Contoh: `order.create`, `order.void`, `discount.apply`, `purchase.approve`, `shift.close`, `report.view`, `product.edit`, `user.manage`, `role.manage`. Ini konstanta di kode karena backend perlu ngecek nama yang pasti.
+- **Permission** — unit izin terkecil, **didefinisikan oleh sistem** (bukan tenant), format `domain.action`. Contoh: `order.create`, `order.void`, `discount.apply`, `discount.override`, `discount.approve`, `discount.manage`, `purchase.approve`, `shift.close`, `report.view`, `report.export`, `landing.manage`, `product.edit`, `user.manage`, `role.manage`, `payroll.run`, `journal.post`, `accounting.close`. Ini konstanta di kode karena backend perlu ngecek nama yang pasti.
 - **Role** — kumpulan permission dengan nama ramah ("Kasir", "Supervisor", "Manajer Outlet"). Ada **preset role** (dibuat sistem, read-only) sebagai titik awal, tapi tenant bebas **bikin role custom** dan pilih-pilih permission sesuka hati. Ini inti "full dinamis".
 - **UserRole** — nempelin role ke user, **di-scope per outlet.** Jadi orang yang sama bisa "Manajer" di Outlet A tapi "Kasir" di Outlet B. Ada juga scope tenant-wide (semua outlet) buat owner.
 
@@ -984,3 +1054,98 @@ Ini bukan afterthought — **responsive itu syarat utama**, karena brewsync jala
 Satu set komponen dasar (tombol, input, kartu, modal, tabel, bottom-sheet) yang udah responsive dari sononya, dipakai lintas semua mode. Nambah layar baru = rakit dari komponen yang sama, otomatis ikut aturan responsive & sentuh. Ini yang bikin "responsive" gak perlu dikerjain ulang tiap fitur. Untuk arah visual & sistem tipografi/spacing, sandarin ke skill `frontend-design`.
 
 > Catatan: cetak (§18) itu "perangkat" keluaran tersendiri — struk thermal punya renderer khusus (lebar tetap 58/80mm), terpisah dari layout layar responsive. Jadi responsive ngurus layar; print ngurus kertas. Dua-duanya view di atas data yang sama.
+
+## 20. HR (karyawan, absensi, payroll)
+
+Modul HR ngurus sisi SDM: siapa karyawannya, jam kerjanya, dan gajinya. Prinsip utamanya sama kayak modul lain — **gak bikin identitas ganda** dan **biaya gaji ngalir ke Accounting lewat event**, bukan panggil langsung.
+
+### 20.1 Karyawan = perpanjangan identitas yang udah ada
+
+Karyawan bukan tabel user baru. Orang yang sama yang login di POS (`User` + `TenantMembership`, §13) itu juga karyawan yang digaji. `Employee` cuma nambahin atribut kepegawaian di atas identitas itu:
+
+```
+Employee { id, tenantId, membershipId, jabatan, tipeKontrak (TETAP|KONTRAK|HARIAN), tanggalMasuk, outletDefaultId?, baseSalary?, hourlyRate?, rekening?, isActive }
+```
+
+Jadi permission (§12) dan identitas tetap satu sumber. Kasir yang absen = karyawan yang sama yang buka shift.
+
+### 20.2 Absensi = ledger, bukan kolom di-update
+
+Absensi ngikutin prinsip append-only (§11 #3). Tiap clock-in/out jadi satu baris; jam kerja & lembur = agregasi, bukan angka yang di-`UPDATE`.
+
+```
+AttendanceRecord { id, tenantId, employeeId, clockIn, clockOut?, sumber (SHIFT|MANUAL|DEVICE), outletId, catatan? }
+```
+
+Kalau outlet pakai shift (§14), absensi bisa diturunkan dari buka/tutup `Shift` — gak dobel input. Kalau enggak, karyawan clock-in mandiri. Cuti punya jalur sendiri:
+
+```
+LeaveRequest { id, tenantId, employeeId, tipe (TAHUNAN|SAKIT|IZIN|...), mulai, selesai, status (REQUESTED|APPROVED|REJECTED), approvedBy?, alasan? }
+```
+
+Saldo cuti juga diturunkan dari jatah − yang kepakai (ledger), bukan kolom saldo.
+
+### 20.3 Payroll — state machine + snapshot
+
+Payroll dihitung per periode dari absensi + komponen gaji. Komponen dibikin data-driven biar fleksibel antar tenant (tiap usaha beda tunjangan/potongan):
+
+```
+PayrollPeriod { id, tenantId, mulai, selesai, status (DRAFT|CALCULATED|APPROVED|PAID) }
+PayrollComponent { id, tenantId, employeeId, periodId, tipe (EARNING|DEDUCTION), nama (GAJI_POKOK|TUNJANGAN|LEMBUR|PPH21|BPJS|...), amount }
+```
+
+Alur status: `DRAFT → CALCULATED → APPROVED → PAID`. **Angka beku saat `APPROVED`** (§11 #7) — kalau master gaji di-edit setelahnya, payroll periode lalu gak berubah. Ini yang bikin slip gaji historis konsisten.
+
+### 20.4 Biaya gaji nyambung ke Accounting lewat event
+
+HR **gak pernah** nulis jurnal akuntansi. Saat payroll `APPROVED`/`PAID`, HR cuma emit event ke outbox (§8):
+
+- `PayrollApproved` → beban gaji diakui (beban gaji vs utang gaji)
+- `SalaryPaid` → utang gaji lunas (utang gaji vs kas/bank)
+
+Accounting (§21) yang nangkep event itu dan bikin jurnalnya. Ini konsisten sama prinsip "POS gak manggil Accounting langsung" — sekarang berlaku juga buat HR. Slip gaji karyawan diturunin dari snapshot payroll, kebatasi permission (`payroll.run` buat jalanin; karyawan lihat slipnya sendiri).
+
+## 21. Accounting (chart of accounts + auto-journal)
+
+Accounting adalah **konsumen event**, bukan modul yang dipanggil. POS, HR, dan Inventory memancarkan event lewat outbox (§8); Accounting mengubahnya jadi jurnal double-entry secara otomatis. Ini yang bikin "laporan lintas modul gampang" — salah satu alasan utama rebuild.
+
+### 21.1 Chart of Accounts
+
+```
+Account { id, tenantId, kode, nama, tipe (ASSET|LIABILITY|EQUITY|REVENUE|EXPENSE), parentId?, isActive }
+```
+
+CoA default di-seed per `BusinessProfile` (§2) — preset FNB beda dikit sama RETAIL/SERVICE — tapi boleh di-custom per tenant.
+
+### 21.2 Jurnal double-entry, buku besar append-only
+
+```
+JournalEntry { id, tenantId, tanggal, sumber (EVENT|MANUAL), refType?, refId?, processedEventId?, keterangan, postedBy?, createdAt }
+JournalLine  { id, tenantId, entryId, accountId, debit, credit }
+```
+
+**Invariant wajib: `SUM(debit) === SUM(credit)`** di tiap entry. Saldo akun = `SUM(line)` (§11 #3, ledger append-only) — gak ada kolom saldo yang di-`UPDATE`. Koreksi = jurnal balik, bukan edit/hapus.
+
+### 21.3 Posting rules — event jadi jurnal
+
+Tiap event punya aturan posting; consumer **idempotent** pakai `processedEventId` unik (§8) biar event dobel gak dobel-jurnal:
+
+| Event (sumber) | Jurnal (garis besar) |
+|---|---|
+| `SaleCompleted` (POS) | kas/piutang (D) · pendapatan (K) · pajak keluaran (K); HPP (D) · persediaan (K) |
+| `ShiftClosed` (POS) | rekonsiliasi kas — selisih ke akun selisih kas |
+| `GoodsReceived` (Inventory) | persediaan (D) · utang usaha (K) |
+| `RefundIssued` (POS) | pendapatan/retur (D) · kas (K) |
+| `StockAdjusted` (Inventory) | selisih persediaan (D/K) · beban penyesuaian |
+| `PayrollApproved` (HR) | beban gaji (D) · utang gaji (K) |
+| `SalaryPaid` (HR) | utang gaji (D) · kas/bank (K) |
+
+Mapping event→akun data-driven per tenant (mis. akun pendapatan bisa dipisah per kategori). Utang usaha (AP) diturunkan dari `GoodsReceived` + `supplier.paymentTermDays` (§4.5) jadi jadwal jatuh tempo; pelunasan supplier = jurnal yang ngurangin utang.
+
+### 21.4 Tutup buku & jurnal manual
+
+Periode punya status `OPEN → CLOSED`. Setelah `CLOSED`, gak nerima jurnal mundur — koreksi lewat jurnal balik di periode berjalan. Tutup buku dijaga `accounting.close`; posting jurnal penyesuaian manual dijaga `journal.post` (§12).
+
+### 21.5 Laporan keuangan
+
+Neraca, Laba-Rugi, Arus Kas, Buku Besar, dan Neraca Saldo semuanya **diturunkan** dari `JournalLine` — bukan tabel terpisah. Jadi laporan keuangan dan laporan operasional (§18) narik dari fondasi yang sama; angka gak mungkin beda. Export PDF/Excel (§18) kebatasi permission `report.export`.
