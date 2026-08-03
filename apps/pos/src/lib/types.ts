@@ -597,3 +597,40 @@ export interface PurchaseOrder {
   items: PurchaseOrderItem[]
   summary?: PurchaseOrderSummary
 }
+
+// --- Landing CMS (S9-02, design §17.1) -------------------------------------
+
+export type LandingSectionType =
+  | 'HERO'
+  | 'CATALOG'
+  | 'ABOUT'
+  | 'GALLERY'
+  | 'CONTACT'
+  | 'HOURS'
+  | 'MAP'
+  | 'CUSTOM'
+
+export type LandingPageStatus = 'DRAFT' | 'PUBLISHED'
+
+/** `content` is a free-form object per type; CATALOG carries id references. */
+export interface LandingSection {
+  id: string
+  type: LandingSectionType
+  position: number
+  title: string | null
+  content: Record<string, unknown>
+  isVisible: boolean
+}
+
+export interface LandingPage {
+  id: string
+  slug: string
+  title: string
+  description: string | null
+  theme: Record<string, unknown> | null
+  orderingEnabled: boolean
+  status: LandingPageStatus
+  publishedAt: string | null
+  updatedAt: string
+  sections: LandingSection[]
+}

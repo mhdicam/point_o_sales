@@ -45,6 +45,7 @@ import { createPurchaseOrderRouter } from './routes/purchase-order.routes.js'
 import { createReservationRouter } from './routes/reservation.routes.js'
 import { createQrRouter } from './routes/qr.routes.js'
 import { createPublicLandingRouter } from './routes/public-landing.routes.js'
+import { createLandingRouter } from './routes/landing.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
 export function createApp(
@@ -165,6 +166,10 @@ export function createApp(
   app.use('/purchase-orders', createPurchaseOrderRouter(db))
   // S8-01 — reservations + state machine (gated on the `reservation` feature).
   app.use('/reservations', createReservationRouter(db))
+  // S9-02 — landing CMS admin. Guarded by LANDING_MANAGE only (not the
+  // `landingPage` feature): an admin may draft the page before enabling it, and
+  // the public read (S9-03) is what enforces the feature, so a draft never leaks.
+  app.use('/landing', createLandingRouter(db))
 
   // S2-04/S2-07 — reference wiring for the two guards. Real feature routes
   // replace this in S3+.

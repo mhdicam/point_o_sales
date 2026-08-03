@@ -30,6 +30,7 @@ function useNavItems(): NavItem[] {
   const canSupplier = usePermission(PERMISSIONS.SUPPLIER_MANAGE)
   const canInventory = usePermission(PERMISSIONS.INVENTORY_VIEW)
   const canPurchase = usePermission(PERMISSIONS.PURCHASE_CREATE)
+  const canLanding = usePermission(PERMISSIONS.LANDING_MANAGE)
   const modifiersOn = useFeature('modifiers')
   const tablesOn = useFeature('tables')
   const kdsOn = useFeature('kds')
@@ -47,6 +48,10 @@ function useNavItems(): NavItem[] {
     { to: '/admin/suppliers', label: 'Suppliers', show: canSupplier && purchasingOn },
     { to: '/admin/inventory', label: 'Inventory', show: canInventory },
     { to: '/admin/purchase-orders', label: 'Purchase orders', show: canPurchase && purchasingOn },
+    // Landing CMS is permission-gated only (no feature gate): an admin may draft
+    // the page before enabling the `landingPage` feature. The public read guards
+    // the feature, so an unpublished draft never leaks.
+    { to: '/admin/landing', label: 'Landing page', show: canLanding },
   ]
 }
 

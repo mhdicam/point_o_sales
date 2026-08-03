@@ -58,6 +58,9 @@ const FloorPlanScreen = lazy(() =>
 const KdsBoardScreen = lazy(() =>
   import('./routes/kds/KdsBoardScreen.tsx').then((m) => ({ default: m.KdsBoardScreen }))
 )
+const LandingAdminScreen = lazy(() =>
+  import('./routes/LandingAdminScreen.tsx').then((m) => ({ default: m.LandingAdminScreen }))
+)
 
 function Lazy({ children }: { children: ReactNode }): ReactNode {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>
@@ -85,6 +88,7 @@ export const router: RouterProviderProps['router'] = createBrowserRouter([
         { path: 'suppliers', element: <Lazy><SuppliersScreen /></Lazy> },
         { path: 'inventory', element: <Lazy><InventoryScreen /></Lazy> },
         { path: 'purchase-orders', element: <Lazy><PurchaseOrdersScreen /></Lazy> },
+        { path: 'landing', element: <Lazy><LandingAdminScreen /></Lazy> },
       ] },
     ],
   },
