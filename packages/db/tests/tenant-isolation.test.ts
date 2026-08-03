@@ -38,6 +38,7 @@ import { PrismaClient, type Prisma } from '../generated/client/index.js'
 import {
   createPrismaClient,
   createUnscopedPrismaClient,
+  createSystemPrismaClient,
   clearTenantGuc,
   runWithTenantContext,
   MissingTenantContextError,
@@ -49,6 +50,7 @@ import {
 // Test database uses TEST_DATABASE_URL (app role) and TEST_DIRECT_DATABASE_URL (owner).
 const APP_ROLE_URL = process.env.TEST_DATABASE_URL!
 const OWNER_ROLE_URL = process.env.TEST_DIRECT_DATABASE_URL!
+const SYSTEM_ROLE_URL = process.env.TEST_UNSCOPED_DATABASE_URL!
 
 interface TenantFixture {
   tenantId: string
@@ -60,12 +62,14 @@ interface TenantFixture {
 let appClient: BrewsyncClient
 let ownerClient: PrismaClient
 let unscopedClient: PrismaClient
+let systemClient: PrismaClient
 let fixtures: TenantFixture[]
 
 beforeAll(async () => {
   appClient = createPrismaClient({ datasourceUrl: APP_ROLE_URL })
   ownerClient = new PrismaClient({ datasourceUrl: OWNER_ROLE_URL })
   unscopedClient = createUnscopedPrismaClient({ datasourceUrl: APP_ROLE_URL })
+  systemClient = createSystemPrismaClient({ datasourceUrl: SYSTEM_ROLE_URL })
 
   // Build fixtures as the owner so writes pass `WITH CHECK`.
   fixtures = await buildFixtures(ownerClient)
@@ -76,6 +80,7 @@ afterAll(async () => {
   await appClient.$disconnect()
   await ownerClient.$disconnect()
   await unscopedClient.$disconnect()
+  await systemClient.$disconnect()
 })
 
 describe('Tenant isolation — two layers', () => {
@@ -150,6 +155,72 @@ describe('Tenant isolation — two layers', () => {
         Number(row?.mismatched ?? -1),
         `TEST_DIRECT_DATABASE_URL connects as "${row?.current_user}", which does not own every tenant-scoped table. Fix with: REASSIGN OWNED BY <wrong-owner> TO ${row?.current_user};`
       ).toBe(0)
+    })
+
+    it('system role: non-superuser, BYPASSRLS, owns no tables', async () => {
+      // The system client is the ONE sanctioned escape hatch from RLS. This
+      // guards the hatch itself: it must be exactly as privileged as its purpose
+      // (cross-tenant READS only) and no more — never a superuser, never an
+      // owner of tenant tables (which would imply ALTER), and BYPASSRLS is what
+      // actually exempts it.
+      const [role] = await systemClient.$queryRawUnsafe<
+        Array<{ rolname: string; rolsuper: boolean; rolbypassrls: boolean }>
+      >(
+        `SELECT rolname, rolsuper, rolbypassrls
+         FROM pg_roles WHERE rolname = current_user`
+      )
+
+      expect(role, 'TEST_UNSCOPED_DATABASE_URL resolved no role').toBeDefined()
+      expect(
+        role?.rolsuper,
+        `TEST_UNSCOPED_DATABASE_URL connects as superuser "${role?.rolname}" — a superuser bypasses RLS anyway, so the system role's BYPASSRLS adds nothing while widening the blast radius.`
+      ).toBe(false)
+
+      const owned = await systemClient.$queryRawUnsafe<Array<{ relname: string }>>(
+        `SELECT c.relname
+         FROM pg_class c
+         WHERE c.relnamespace = 'public'::regnamespace
+           AND c.relkind = 'r'
+           AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+         ORDER BY 1`
+      )
+
+      expect(
+        owned.map((r) => r.relname),
+        `The system role owns tables — ownership implies ALTER, which can switch RLS off. It should be a pure reader.`
+      ).toEqual([])
+    })
+  })
+
+  describe('System client: the one cross-tenant read path', () => {
+    it('reads across tenants without a bound GUC', async () => {
+      const [tenantA, tenantB] = fixtures as [TenantFixture, TenantFixture]
+
+      // No GUC bound anywhere: the system role's BYPASSRLS is the entire
+      // mechanism, and that is the point under test.
+      const outlets = await systemClient.outlet.findMany({
+        where: { id: { in: [tenantA.outletId, tenantB.outletId] } },
+      })
+
+      expect(outlets.map((o) => o.code).sort()).toEqual(
+        [tenantA.outletCode, tenantB.outletCode].sort()
+      )
+    })
+
+    it('sees rows the app client cannot (fail-closed contrast)', async () => {
+      const [tenantA] = fixtures as [TenantFixture, TenantFixture]
+
+      // The app client with NO bound tenant is fail-closed: zero rows. The same
+      // query on the system client sees the rows. This is the exact asymmetry
+      // the public QR/landing/session/outbox reads rely on.
+      await clearTenantGuc(unscopedClient)
+      const appSees = await unscopedClient.outlet.findMany()
+      expect(appSees).toHaveLength(0)
+
+      const systemSees = await systemClient.outlet.findMany({
+        where: { id: tenantA.outletId },
+      })
+      expect(systemSees).toHaveLength(1)
     })
   })
 

@@ -21,6 +21,7 @@ import type { Config } from '../config.js'
 import { SessionService } from '../services/session.service.js'
 import { TokenService } from '../services/token.service.js'
 import { unauthorized } from '../http-error.js'
+import type { SystemClient } from '../system-client.js'
 
 const selectSchema = z.object({
   tenantId: z.string().uuid(),
@@ -28,9 +29,9 @@ const selectSchema = z.object({
   outletId: z.string().uuid().optional(),
 })
 
-export function createSessionRouter(db: BrewsyncClient, config: Config): Router {
+export function createSessionRouter(db: BrewsyncClient, config: Config, system: SystemClient): Router {
   const router = Router()
-  const sessionService = new SessionService(db)
+  const sessionService = new SessionService(db, system)
   const tokenService = new TokenService(config, db)
 
   /**

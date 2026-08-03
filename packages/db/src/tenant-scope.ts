@@ -56,6 +56,32 @@ export const TENANT_SCOPED_MODELS = new Set<string>([
   'Order',
   'OrderItem',
   'OrderCharge',
+  // Payment — S5
+  'PaymentMethod',
+  'Bill',
+  'Payment',
+  // Shift — S5
+  'Shift',
+  'CashMovement',
+  // Sales method — S7
+  'SalesMethod',
+  // Floor plan — S7
+  'Area',
+  'Table',
+  // KDS — S7
+  'Station',
+  // Inventory & purchasing — S6
+  'StockMovement',
+  'Recipe',
+  'RecipeItem',
+  'Supplier',
+  'PurchaseOrder',
+  'PurchaseOrderItem',
+  // Reservation — S8
+  'Reservation',
+  // Landing page — S9
+  'LandingPage',
+  'LandingSection',
 ])
 
 /**

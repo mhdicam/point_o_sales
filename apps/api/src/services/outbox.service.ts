@@ -12,12 +12,30 @@
 
 import type { Logger } from '../logger.js'
 import type { BrewsyncClient } from '@brewsync/db'
-import { runUnscoped } from '@brewsync/db'
+import { runWithTenantContext } from '@brewsync/db'
 import type { Config } from '../config.js'
+import type { SystemClient } from '../system-client.js'
 
 export interface OutboxWorkerOptions {
   pollIntervalMs?: number
   batchSize?: number
+  /**
+   * Optional side-effect run for every event as it dispatches, before it is
+   * marked processed. The realtime hubs (S7-05) subscribe here to fan events to
+   * connected clients. Kept as a callback so the worker's core stays ignorant of
+   * who consumes — producers never know their consumers (standard #4).
+   */
+  onEvent?: (event: DispatchedEvent) => void
+}
+
+/** The shape handed to `onEvent` — the persisted outbox row, minus bookkeeping. */
+export interface DispatchedEvent {
+  id: string
+  /** Owning tenant — needed to bind RLS context for the dispatched-marker write. */
+  tenantId: string
+  type: string
+  outletId: string | null
+  payload: unknown
 }
 
 export class OutboxWorker {
@@ -26,6 +44,7 @@ export class OutboxWorker {
 
   constructor(
     private readonly db: BrewsyncClient,
+    private readonly system: SystemClient,
     private readonly logger: Logger,
     private readonly options: OutboxWorkerOptions = {}
   ) {}
@@ -69,14 +88,16 @@ export class OutboxWorker {
   private async processBatch(): Promise<void> {
     const batchSize = this.options.batchSize ?? 50
 
-    // Cross-tenant sweep — the worker is deliberately unscoped.
-    const events = await runUnscoped(() =>
-      this.db.outboxEvent.findMany({
-        where: { dispatchedAt: null },
-        orderBy: { occurredAt: 'asc' },
-        take: batchSize,
-      })
-    )
+    // Cross-tenant sweep — the worker is deliberately unscoped. Reads run on the
+    // system client (brewsync_system, BYPASSRLS): the app client is RLS-subject,
+    // and with no bound GUC it would return zero rows. The dispatched-marker
+    // writes below then bind each event's own tenant via runWithTenantContext,
+    // so every mutation stays RLS-enforced — the system role has SELECT only.
+    const events = await this.system.outboxEvent.findMany({
+      where: { dispatchedAt: null },
+      orderBy: { occurredAt: 'asc' },
+      take: batchSize,
+    })
 
     if (events.length === 0) return
 
@@ -87,37 +108,47 @@ export class OutboxWorker {
     }
   }
 
-  private async dispatch(event: { id: string; type: string; payload: unknown }): Promise<void> {
+  private async dispatch(event: DispatchedEvent): Promise<void> {
     try {
       // Idempotency: check if already processed elsewhere (concurrent worker, retry).
-      const existing = await runUnscoped(() =>
-        this.db.processedEvent.findUnique({
-          where: { eventId_consumer: { eventId: event.id, consumer: 'default' } },
-        })
-      )
+      // `processedEvent` is global (no tenantId), so a plain scoped read suffices;
+      // its unique key is the event id.
+      const existing = await this.db.processedEvent.findUnique({
+        where: { eventId_consumer: { eventId: event.id, consumer: 'default' } },
+      })
 
       if (existing) {
         this.logger.debug({ eventId: event.id }, 'Event already processed')
-        await this.markDispatched(event.id)
+        await this.markDispatched(event)
         return
       }
 
-      // Dispatch to the appropriate handler. Real handlers are registered in a
-      // map (not implemented here — that's post-MVP when events actually route
-      // somewhere). For now, just mark it dispatched and log.
+      // Fan to in-process consumers (realtime hubs, S7-05). Failure here must not
+      // wedge the outbox — a dropped realtime frame is recoverable (clients
+      // refetch), a stuck worker is not.
+      if (this.options.onEvent) {
+        try {
+          this.options.onEvent(event)
+        } catch (error) {
+          this.logger.error({ eventId: event.id, error }, 'Outbox onEvent handler failed')
+        }
+      }
+
       this.logger.info({ eventId: event.id, type: event.type }, 'Event dispatched')
 
-      await runUnscoped(() =>
+      // Bind the event's tenant: every row this worker writes is tenant-owned and
+      // must pass RLS WITH CHECK under that tenant's GUC.
+      await runWithTenantContext({ tenantId: event.tenantId }, () =>
         this.db.processedEvent.create({
           data: { eventId: event.id, consumer: 'default', processedAt: new Date() },
         })
       )
 
-      await this.markDispatched(event.id)
+      await this.markDispatched(event)
     } catch (error) {
       this.logger.error({ eventId: event.id, error }, 'Event dispatch failed')
 
-      await runUnscoped(() =>
+      await runWithTenantContext({ tenantId: event.tenantId }, () =>
         this.db.outboxEvent.update({
           where: { id: event.id },
           data: {
@@ -129,20 +160,27 @@ export class OutboxWorker {
     }
   }
 
-  private async markDispatched(eventId: string): Promise<void> {
-    await runUnscoped(() =>
+  private async markDispatched(event: DispatchedEvent): Promise<void> {
+    await runWithTenantContext({ tenantId: event.tenantId }, () =>
       this.db.outboxEvent.update({
-        where: { id: eventId },
+        where: { id: event.id },
         data: { dispatchedAt: new Date() },
       })
     )
   }
 }
 
-export function startOutboxWorker(db: BrewsyncClient, logger: Logger, config: Config): OutboxWorker {
-  const worker = new OutboxWorker(db, logger, {
+export function startOutboxWorker(
+  db: BrewsyncClient,
+  system: SystemClient,
+  logger: Logger,
+  config: Config,
+  onEvent?: (event: DispatchedEvent) => void
+): OutboxWorker {
+  const worker = new OutboxWorker(db, system, logger, {
     pollIntervalMs: config.OUTBOX_POLL_INTERVAL_MS,
     batchSize: config.OUTBOX_BATCH_SIZE,
+    ...(onEvent ? { onEvent } : {}),
   })
 
   worker.start()

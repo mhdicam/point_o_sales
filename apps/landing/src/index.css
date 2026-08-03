@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * Design tokens as RGB triples so Tailwind's `<alpha-value>` slot works. Palette
+ * mirrors the POS app; light-only for now. The customer page is phone-portrait
+ * first (design §19), so the body is a neutral backdrop behind a centered
+ * single-column frame.
+ */
+:root {
+  --color-brand: 37 99 235; /* blue-600 */
+  --color-surface: 255 255 255;
+  --color-surface-muted: 244 245 247;
+  --color-ink: 17 24 39; /* gray-900 */
+  --color-ink-muted: 107 114 128; /* gray-500 */
+  --color-line: 226 232 240; /* slate-200 */
+  --color-danger: 220 38 38; /* red-600 */
+
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--color-surface-muted));
+  color: rgb(var(--color-ink));
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The cart bottom-sheet slides up on transform only (design §19: animate only
+   transform/opacity), and the whole thing collapses to an instant change under
+   the accessibility setting. */
+@keyframes sheet-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.animate-sheet-up {
+  animation: sheet-up 220ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

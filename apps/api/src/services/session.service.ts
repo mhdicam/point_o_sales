@@ -14,8 +14,9 @@
  */
 
 import type { BrewsyncClient } from '@brewsync/db'
-import { runUnscoped, runWithTenantContext } from '@brewsync/db'
+import { runWithTenantContext } from '@brewsync/db'
 import { forbidden } from '../http-error.js'
+import type { SystemClient } from '../system-client.js'
 
 export interface MembershipSummary {
   tenantId: string
@@ -32,30 +33,28 @@ export interface SelectedScope {
 }
 
 export class SessionService {
-  constructor(private readonly db: BrewsyncClient) {}
+  constructor(
+    private readonly db: BrewsyncClient,
+    private readonly system: SystemClient
+  ) {}
 
   /**
    * Tenants this user can act in, with the outlets of each.
    *
-   * Runs unscoped by necessity: the whole point is to read *across* tenants, and
-   * the caller has no tenant context yet. The `userId` filter is what bounds the
-   * result — it comes from the verified token, never from the request body.
+   * Reads the memberships through the system client (`brewsync_system`,
+   * BYPASSRLS) by necessity: the whole point is to read *across* tenants, and the
+   * caller has no tenant context yet — the RLS-subject app client would return
+   * zero rows. The `userId` filter is what bounds the result — it comes from the
+   * verified token, never from the request body.
    */
   async listMemberships(userId: string): Promise<MembershipSummary[]> {
-    // The inner `await` is load-bearing, exactly as on the scoped reads below: a
-    // Prisma delegate returns a lazy promise that only dispatches on `.then()`,
-    // so returning it unawaited lets the runUnscoped frame exit first. The query
-    // would then run under the caller's context — which, post-login, carries an
-    // empty-string tenantId — and the extension would inject `tenantId: ''`,
-    // failing as an invalid UUID rather than reading across tenants.
-    const memberships = await runUnscoped(
-      async () =>
-        await this.db.tenantMembership.findMany({
-          where: { userId, status: 'ACTIVE' },
-          include: { tenant: { select: { id: true, name: true, slug: true } } },
-          orderBy: { joinedAt: 'asc' },
-        })
-    )
+    // No runUnscoped frame needed: the system client has no tenant-scope
+    // extension, so there is no context to get wrong.
+    const memberships = await this.system.tenantMembership.findMany({
+      where: { userId, status: 'ACTIVE' },
+      include: { tenant: { select: { id: true, name: true, slug: true } } },
+      orderBy: { joinedAt: 'asc' },
+    })
 
     if (memberships.length === 0) return []
 
@@ -100,20 +99,17 @@ export class SessionService {
     tenantId: string,
     outletId?: string | undefined
   ): Promise<SelectedScope> {
-    // Load-bearing inner `await` — see listMemberships. Without it this runs
-    // under the caller's empty-string tenant context, not runUnscoped.
-    const membership = await runUnscoped(
-      async () =>
-        await this.db.tenantMembership.findFirst({
-          // Legitimate manual tenant filter (standard #1 exception): this runs
-          // under runUnscoped because the user is not yet scoped into any tenant
-          // — they are requesting to be. The extension injects nothing here, so
-          // the membership must be matched to the requested tenant by hand.
-          // eslint-disable-next-line no-restricted-syntax -- pre-scope membership check, see above
-          where: { userId, tenantId, status: 'ACTIVE' },
-          select: { id: true },
-        })
-    )
+    // System client: the user is not yet scoped into any tenant — they are
+    // requesting to be — so this runs without a tenant context.
+    const membership = await this.system.tenantMembership.findFirst({
+      // Legitimate manual tenant filter (standard #1 exception): this runs on
+      // the unscoped system client because the user is not yet scoped into any
+      // tenant — they are requesting to be. The client injects nothing, so the
+      // membership must be matched to the requested tenant by hand.
+      // eslint-disable-next-line no-restricted-syntax -- pre-scope membership check, see above
+      where: { userId, tenantId, status: 'ACTIVE' },
+      select: { id: true },
+    })
 
     // Same message for "not a member" and "no such tenant": telling the two
     // apart would turn this into a tenant-enumeration oracle.

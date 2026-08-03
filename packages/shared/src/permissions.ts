@@ -45,6 +45,10 @@ export const PERMISSIONS = {
   // Floor configuration
   TABLE_MANAGE: 'table.manage',
   RESERVATION_MANAGE: 'reservation.manage',
+  STATION_MANAGE: 'station.manage',
+
+  // Kitchen display
+  KDS_BUMP: 'kds.bump',
 
   // Reporting
   REPORT_VIEW: 'report.view',
@@ -130,6 +134,16 @@ export const PERMISSION_DEFINITIONS: readonly PermissionDefinition[] = [
     domain: 'reservation',
     description: 'Manage reservations',
   },
+  {
+    key: PERMISSIONS.STATION_MANAGE,
+    domain: 'station',
+    description: 'Manage KDS prep stations',
+  },
+  {
+    key: PERMISSIONS.KDS_BUMP,
+    domain: 'kds',
+    description: 'View the kitchen display and advance ticket lanes',
+  },
   { key: PERMISSIONS.REPORT_VIEW, domain: 'report', description: 'View operational reports' },
   { key: PERMISSIONS.REPORT_EXPORT, domain: 'report', description: 'Export reports to PDF/Excel' },
   {
@@ -183,6 +197,8 @@ export const PRESET_ROLES: readonly { name: string; permissions: readonly Permis
       PERMISSIONS.SUPPLIER_MANAGE,
       PERMISSIONS.TABLE_MANAGE,
       PERMISSIONS.RESERVATION_MANAGE,
+      PERMISSIONS.STATION_MANAGE,
+      PERMISSIONS.KDS_BUMP,
       PERMISSIONS.REPORT_VIEW,
       PERMISSIONS.REPORT_EXPORT,
       PERMISSIONS.REPORT_FINANCIAL_VIEW,
@@ -207,6 +223,7 @@ export const PRESET_ROLES: readonly { name: string; permissions: readonly Permis
       PERMISSIONS.INVENTORY_VIEW,
       PERMISSIONS.TABLE_MANAGE,
       PERMISSIONS.RESERVATION_MANAGE,
+      PERMISSIONS.KDS_BUMP,
       PERMISSIONS.REPORT_VIEW,
     ],
   },
@@ -224,6 +241,6 @@ export const PRESET_ROLES: readonly { name: string; permissions: readonly Permis
   },
   {
     name: 'Dapur',
-    permissions: [PERMISSIONS.PRODUCT_VIEW],
+    permissions: [PERMISSIONS.PRODUCT_VIEW, PERMISSIONS.KDS_BUMP],
   },
 ]

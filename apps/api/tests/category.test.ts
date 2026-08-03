@@ -32,7 +32,15 @@ import { CategoryService } from '../src/services/category.service.js'
 loadEnv({ path: resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
 
 const APP_ROLE_URL = process.env.TEST_DATABASE_URL!
-const OWNER_ROLE_URL = process.env.TEST_DIRECT_DATABASE_URL!
+const OWNER_ROLE_URL = withConnectionLimitOne(process.env.TEST_DIRECT_DATABASE_URL!)
+
+/**
+ * Pin the owner client to one connection so a session-level GUC persists across
+ * the raw fixture inserts (outlet + stations are FORCE-RLS tables).
+ */
+function withConnectionLimitOne(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}connection_limit=1`
+}
 
 describe('S3 — category tree', () => {
   const dbApp = createPrismaClient({ datasourceUrl: APP_ROLE_URL })
@@ -41,6 +49,10 @@ describe('S3 — category tree', () => {
 
   const runId = randomUUID().slice(0, 8)
   let tenantId: string
+  // A real outlet + two real stations back the `defaultStationId` FK the
+  // "resolves each field independently" case sets on a category.
+  let stationA: string
+  let stationB: string
   let seq = 0
 
   /**
@@ -88,6 +100,30 @@ describe('S3 — category tree', () => {
       `
     )
     tenantId = rows[0]!.id
+
+    // RLS is FORCEd, so even the owner is subject to it. The owner client is
+    // pinned to one connection, so this session-level GUC stays bound across the
+    // tenant-scoped inserts below (outlet + stations).
+    await dbOwner.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, false)`, tenantId)
+
+    const [outlet] = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO outlets (id, "tenantId", code, name, status, "updatedAt")
+      VALUES (gen_random_uuid(), ${tenantId}::uuid, 'MAIN', 'Main', 'ACTIVE', now())
+      RETURNING id
+    `
+    const outletId = outlet!.id
+
+    // `Category.defaultStationId` is an FK to `stations` (onDelete: SetNull), so
+    // the inheritance case needs real stations rather than bare random UUIDs.
+    const stations = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO stations (id, "tenantId", "outletId", name, "updatedAt")
+      VALUES
+        (gen_random_uuid(), ${tenantId}::uuid, ${outletId}::uuid, ${`Station A ${runId}`}, now()),
+        (gen_random_uuid(), ${tenantId}::uuid, ${outletId}::uuid, ${`Station B ${runId}`}, now())
+      RETURNING id
+    `
+    stationA = stations[0]!.id
+    stationB = stations[1]!.id
   })
 
   afterAll(async () => {
@@ -181,9 +217,6 @@ describe('S3 — category tree', () => {
   })
 
   describe('default inheritance', () => {
-    const stationA = randomUUID()
-    const stationB = randomUUID()
-
     it('returns all nulls for a root that sets nothing', async () => {
       const root = await makeCategory('Bare')
 

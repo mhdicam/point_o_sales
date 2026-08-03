@@ -16,7 +16,7 @@ import { randomUUID } from 'node:crypto'
 import { config as loadEnv } from 'dotenv'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import request from 'supertest'
-import { createPrismaClient, runUnscoped } from '@brewsync/db'
+import { createPrismaClient, createSystemPrismaClient } from '@brewsync/db'
 import { PERMISSIONS } from '@brewsync/shared'
 import { loadConfig } from '../src/config.js'
 import { createLogger } from '../src/logger.js'
@@ -28,12 +28,18 @@ loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../../.env'
 const APP_ROLE_URL = process.env.TEST_DATABASE_URL!
 const OWNER_ROLE_URL = process.env.TEST_DIRECT_DATABASE_URL!
 
+/** Pin the owner client to one connection so a session-level GUC persists. */
+function withConnectionLimitOne(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}connection_limit=1`
+}
+
 describe('S2-04 — permission guards', () => {
   const dbApp = createPrismaClient({ datasourceUrl: APP_ROLE_URL })
-  const dbOwner = createPrismaClient({ datasourceUrl: OWNER_ROLE_URL })
+  const dbOwner = createPrismaClient({ datasourceUrl: withConnectionLimitOne(OWNER_ROLE_URL) })
   const config = loadConfig()
   const logger = createLogger(config)
-  const app = createApp(dbApp, config, logger)
+  const dbSystem = createSystemPrismaClient({ datasourceUrl: process.env.TEST_UNSCOPED_DATABASE_URL ?? '' })
+  const app = createApp(dbApp, config, logger, dbSystem)
 
   // Fixtures are namespaced per run. `User` is a global model with a unique
   // email and is not reachable by the tenant cascade, so a suite that reused a
@@ -74,16 +80,16 @@ describe('S2-04 — permission guards', () => {
     }
 
     // Build tenant fixtures as the owner so RLS WITH CHECK is satisfied.
-    const tenantRow = await runUnscoped(() =>
-      dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
-        VALUES (gen_random_uuid(), ${`guard-test-${runId}`}, 'Guard Test Tenant', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
-        RETURNING id
-      `
-    )
+    const tenantRow = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
+      VALUES (gen_random_uuid(), ${`guard-test-${runId}`}, 'Guard Test Tenant', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
+      RETURNING id
+    `
     tenantId = tenantRow[0]!.id
 
-    // Set the GUC so the outlet insert passes RLS.
+    // Set the GUC so the outlet insert passes RLS. Owner is FORCE-RLS-subject
+    // and the client is pinned to one connection, so this sticks for the raw
+    // tenant-scoped inserts below.
     await dbOwner.$executeRawUnsafe(
       `SELECT set_config('app.current_tenant', $1, false)`,
       tenantId
@@ -105,13 +111,11 @@ describe('S2-04 — permission guards', () => {
     const roleId = roleRow[0]!.id
 
     // Seed the permission catalog if it doesn't exist (global, no GUC).
-    await runUnscoped(() =>
-      dbOwner.$executeRaw`
-        INSERT INTO permissions (key, domain, description)
-        VALUES (${PERMISSIONS.PRODUCT_VIEW}, 'product', 'View products')
-        ON CONFLICT (key) DO NOTHING
-      `
-    )
+    await dbOwner.$executeRaw`
+      INSERT INTO permissions (key, domain, description)
+      VALUES (${PERMISSIONS.PRODUCT_VIEW}, 'product', 'View products')
+      ON CONFLICT (key) DO NOTHING
+    `
 
     await dbOwner.$executeRaw`
       INSERT INTO role_permissions ("roleId", "permissionKey")
@@ -137,14 +141,10 @@ describe('S2-04 — permission guards', () => {
     // that context is only chosen after login.
     const tokenService = new TokenService(config, dbOwner)
     userWithPermission.accessToken = (
-      await runUnscoped(() =>
-        tokenService.issue({ sub: userWithPermission.id, tenantId, outletId })
-      )
+      await tokenService.issue({ sub: userWithPermission.id, tenantId, outletId })
     ).accessToken
     userWithoutPermission.accessToken = (
-      await runUnscoped(() =>
-        tokenService.issue({ sub: userWithoutPermission.id, tenantId, outletId })
-      )
+      await tokenService.issue({ sub: userWithoutPermission.id, tenantId, outletId })
     ).accessToken
   })
 
@@ -152,14 +152,13 @@ describe('S2-04 — permission guards', () => {
     // Deleting the tenant cascades to outlets, memberships, roles and role
     // assignments. Users are global, so they need deleting on their own — their
     // refresh tokens cascade from there.
-    await runUnscoped(async () => {
-      await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${tenantId}::uuid`
-      await dbOwner.$executeRaw`
-        DELETE FROM users WHERE email IN (${allowedEmail}, ${deniedEmail})
-      `
-    })
+    await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${tenantId}::uuid`
+    await dbOwner.$executeRaw`
+      DELETE FROM users WHERE email IN (${allowedEmail}, ${deniedEmail})
+    `
     await dbApp.$disconnect()
     await dbOwner.$disconnect()
+    await dbSystem.$disconnect()
   })
 
   it('allows a user with the required permission', async () => {

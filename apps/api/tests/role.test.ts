@@ -12,7 +12,7 @@ import { config as loadEnv } from 'dotenv'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import supertest from 'supertest'
 import { createApp } from '../src/app.js'
-import { runUnscoped, createPrismaClient, seedPermissionCatalog } from '@brewsync/db'
+import { createPrismaClient, createSystemPrismaClient, seedPermissionCatalog } from '@brewsync/db'
 import { PrismaClient } from '@brewsync/db'
 import { PERMISSIONS } from '@brewsync/shared'
 import { loadConfig } from '../src/config.js'
@@ -21,11 +21,21 @@ import { TokenService } from '../src/services/token.service.js'
 
 loadEnv({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
 
+/** Pin the owner client to one connection so a session-level GUC persists. */
+function withConnectionLimitOne(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}connection_limit=1`
+}
+
 describe('Role CRUD', () => {
   const config = loadConfig()
   const logger = createLogger(config)
-  const dbOwner = createPrismaClient({ datasourceUrl: process.env.TEST_DIRECT_DATABASE_URL ?? '' })
-  const app = createApp(dbOwner, config, logger)
+  // Pinned so the set_config below binds the session the raw RLS-table inserts
+  // run on (owner is FORCE-RLS-subject; an unbound connection returns 42501).
+  const dbOwner = createPrismaClient({
+    datasourceUrl: withConnectionLimitOne(process.env.TEST_DIRECT_DATABASE_URL ?? ''),
+  })
+  const dbSystem = createSystemPrismaClient({ datasourceUrl: process.env.TEST_UNSCOPED_DATABASE_URL ?? '' })
+  const app = createApp(dbOwner, config, logger, dbSystem)
   const request = supertest(app)
 
   const runId = randomUUID().slice(0, 8)
@@ -45,13 +55,11 @@ describe('Role CRUD', () => {
     await plainClient.$disconnect()
 
     // Create tenant with one preset role to test immutability.
-    const tenantRow = await runUnscoped(() =>
-      dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
-        VALUES (gen_random_uuid(), ${`role-test-${runId}`}, 'Role Test Tenant', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
-        RETURNING id
-      `
-    )
+    const tenantRow = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO tenants (id, slug, name, status, timezone, currency, "updatedAt")
+      VALUES (gen_random_uuid(), ${`role-test-${runId}`}, 'Role Test Tenant', 'ACTIVE', 'Asia/Jakarta', 'IDR', now())
+      RETURNING id
+    `
     tenantId = tenantRow[0]!.id
 
     await dbOwner.$executeRawUnsafe(
@@ -80,13 +88,11 @@ describe('Role CRUD', () => {
       VALUES (${systemRoleId}::uuid, ${PERMISSIONS.ROLE_MANAGE})
     `
 
-    const userRow = await runUnscoped(() =>
-      dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO users (id, email, "fullName", status, "passwordHash", "updatedAt")
-        VALUES (gen_random_uuid(), ${userEmail}, 'Role Test User', 'ACTIVE', 'unused', now())
-        RETURNING id
-      `
-    )
+    const userRow = await dbOwner.$queryRaw<Array<{ id: string }>>`
+      INSERT INTO users (id, email, "fullName", status, "passwordHash", "updatedAt")
+      VALUES (gen_random_uuid(), ${userEmail}, 'Role Test User', 'ACTIVE', 'unused', now())
+      RETURNING id
+    `
     userId = userRow[0]!.id
 
     await dbOwner.$executeRaw`
@@ -100,19 +106,14 @@ describe('Role CRUD', () => {
     `
 
     const tokenService = new TokenService(config, dbOwner)
-    accessToken = (
-      await runUnscoped(() =>
-        tokenService.issue({ sub: userId, tenantId, outletId })
-      )
-    ).accessToken
+    accessToken = (await tokenService.issue({ sub: userId, tenantId, outletId })).accessToken
   })
 
   afterAll(async () => {
-    await runUnscoped(async () => {
-      await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${tenantId}::uuid`
-      await dbOwner.$executeRaw`DELETE FROM users WHERE email = ${userEmail}`
-    })
+    await dbOwner.$executeRaw`DELETE FROM tenants WHERE id = ${tenantId}::uuid`
+    await dbOwner.$executeRaw`DELETE FROM users WHERE email = ${userEmail}`
     await dbOwner.$disconnect()
+    await dbSystem.$disconnect()
   })
 
   it('creates a custom role and returns it with permissions', async () => {

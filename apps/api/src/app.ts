@@ -14,6 +14,7 @@ import pinoHttp from 'pino-http'
 import type { Logger } from 'pino'
 import type { BrewsyncClient } from '@brewsync/db'
 import type { Config } from './config.js'
+import type { SystemClient } from './system-client.js'
 import { createAuthRouter, errorHandler } from './routes/auth.routes.js'
 import { createHealthRouter } from './routes/health.routes.js'
 import { createPinRouter } from './routes/pin.routes.js'
@@ -32,9 +33,27 @@ import {
 import { createModifierRouter, createProductModifierRouter } from './routes/modifier.routes.js'
 import { createPriceRouter } from './routes/price.routes.js'
 import { createOrderRouter } from './routes/order.routes.js'
+import { createPaymentRouter } from './routes/payment.routes.js'
+import { createShiftRouter } from './routes/shift.routes.js'
+import { createSalesMethodRouter } from './routes/sales-method.routes.js'
+import { createFloorPlanRouter } from './routes/floor-plan.routes.js'
+import { createKdsRouter } from './routes/kds.routes.js'
+import { createStockRouter } from './routes/stock.routes.js'
+import { createRecipeRouter } from './routes/recipe.routes.js'
+import { createSupplierRouter } from './routes/supplier.routes.js'
+import { createPurchaseOrderRouter } from './routes/purchase-order.routes.js'
+import { createReservationRouter } from './routes/reservation.routes.js'
+import { createQrRouter } from './routes/qr.routes.js'
+import { createPublicLandingRouter } from './routes/public-landing.routes.js'
+import { createLandingRouter } from './routes/landing.routes.js'
 import { createTenantMiddleware } from './middleware/tenant.middleware.js'
 
-export function createApp(db: BrewsyncClient, config: Config, logger: Logger): Express {
+export function createApp(
+  db: BrewsyncClient,
+  config: Config,
+  logger: Logger,
+  system: SystemClient
+): Express {
   const app = express()
 
   // Structured request logging — every line carries requestId.
@@ -80,6 +99,21 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
     app.use('/onboarding', onboardingRouter)
   }
 
+  // S8-06 — QR self-service ordering. Pre-tenant by necessity: a customer
+  // scanning a table QR holds no token. The router self-binds tenant/outlet
+  // context from the resolved token (never client input) — the safest of the
+  // pre-tenant routes. It carries its own per-IP rate limiter; `/pin` and future
+  // `/online` ordering should adopt the same `createRateLimit` factory.
+  app.use(createQrRouter(db, system))
+
+  // S9-03 — public landing page (`/p/:slug`). Pre-tenant by necessity: a customer
+  // opening a public catalog holds no token. The router self-binds tenant/outlet
+  // context from the resolved PUBLISHED slug (never client input), gated on the
+  // `landingPage` feature inside the service, and carries its own per-IP limiter.
+  // The authenticated `/landing` CMS surface (S9-02) mounts after the tenant
+  // middleware below.
+  app.use(createPublicLandingRouter(db, system))
+
   // ---- Everything below requires a valid access token. ----
 
   // S1-02 — binds tenant context from the JWT for the Prisma extension.
@@ -88,7 +122,7 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   // S2-09 — tenant selection. Mounted here (token required) but deliberately
   // NOT behind requireTenant: an email/password session holds no tenant yet,
   // and this is the route that gives it one.
-  app.use('/session', createSessionRouter(db, config))
+  app.use('/session', createSessionRouter(db, config, system))
 
   // S2-03/S2-05 — effective permissions, consumed by the FE usePermission hook.
   app.use('/me', createMeRouter(db))
@@ -109,6 +143,33 @@ export function createApp(db: BrewsyncClient, config: Config, logger: Logger): E
   app.use('/products', createProductModifierRouter(db))
   app.use('/prices', createPriceRouter(db))
   app.use('/orders', createOrderRouter(db))
+  // S5-01..05 — bills, tenders, split, refund. Sits after /orders because it
+  // settles orders the bill pipeline (S4) produced.
+  app.use('/payments', createPaymentRouter(db))
+  // S5-06/07 — shift open/close + cash drawer ledger.
+  app.use('/shifts', createShiftRouter(db))
+  // S7-01 — sales method config (dine-in / takeaway / delivery).
+  app.use('/sales-methods', createSalesMethodRouter(db))
+  // S7-02 — floor plan: areas + tables (gated on the `tables` feature).
+  app.use('/floor-plan', createFloorPlanRouter(db))
+  // S7-04 — stations + KDS board. Mounted at '/' because its routes (/stations,
+  // /kds/*) share no prefix; the `kds` feature is guarded per-route (not via a
+  // router-level `use`, which at this mount would gate the entire app).
+  app.use('/', createKdsRouter(db))
+  // S6-01 — stock ledger: on-hand, inventory-card history, stock-take adjust.
+  app.use('/inventory', createStockRouter(db))
+  // S6-03 — recipe / BOM per variant (gated on the `recipe` feature).
+  app.use('/variants', createRecipeRouter(db))
+  // S6-05 — supplier master (gated on the `purchasing` feature).
+  app.use('/suppliers', createSupplierRouter(db))
+  // S6-06 — purchase orders + state machine (gated on the `purchasing` feature).
+  app.use('/purchase-orders', createPurchaseOrderRouter(db))
+  // S8-01 — reservations + state machine (gated on the `reservation` feature).
+  app.use('/reservations', createReservationRouter(db))
+  // S9-02 — landing CMS admin. Guarded by LANDING_MANAGE only (not the
+  // `landingPage` feature): an admin may draft the page before enabling it, and
+  // the public read (S9-03) is what enforces the feature, so a draft never leaks.
+  app.use('/landing', createLandingRouter(db))
 
   // S2-04/S2-07 — reference wiring for the two guards. Real feature routes
   // replace this in S3+.

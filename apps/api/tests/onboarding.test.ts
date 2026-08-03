@@ -13,7 +13,7 @@ import { config as loadEnv } from 'dotenv'
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import supertest from 'supertest'
 import { createApp } from '../src/app.js'
-import { runUnscoped, createPrismaClient, seedPermissionCatalog } from '@brewsync/db'
+import { runUnscoped, createPrismaClient, createSystemPrismaClient, seedPermissionCatalog } from '@brewsync/db'
 import { PrismaClient } from '@brewsync/db'
 import { loadConfig } from '../src/config.js'
 import { createLogger } from '../src/logger.js'
@@ -24,7 +24,8 @@ describe('Onboarding', () => {
   const config = loadConfig({ ...process.env, PLATFORM_API_TOKEN: 'test-platform-token-12345' })
   const logger = createLogger(config)
   const dbOwner = createPrismaClient({ datasourceUrl: process.env.TEST_DIRECT_DATABASE_URL ?? '' })
-  const app = createApp(dbOwner, config, logger)
+  const dbSystem = createSystemPrismaClient({ datasourceUrl: process.env.TEST_UNSCOPED_DATABASE_URL ?? '' })
+  const app = createApp(dbOwner, config, logger, dbSystem)
   const request = supertest(app)
 
   // Fixtures are namespaced per run so a failed test leaves no collision on retry.
@@ -55,6 +56,7 @@ describe('Onboarding', () => {
       await dbOwner.$executeRaw`DELETE FROM users WHERE email = ${email}`
     })
     await dbOwner.$disconnect()
+    await dbSystem.$disconnect()
   })
 
   it('provisions a tenant with the FNB preset and returns the full topology', async () => {

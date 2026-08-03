@@ -72,4 +72,30 @@ export const RLS_TABLES = [
   'orders',
   'order_items',
   'order_charges',
+  // Payment — S5
+  'payment_methods',
+  'bills',
+  'payments',
+  // Shift — S5
+  'shifts',
+  'cash_movements',
+  // Sales method — S7
+  'sales_methods',
+  // Floor plan — S7
+  'areas',
+  'tables',
+  // KDS — S7
+  'stations',
+  // Inventory & purchasing — S6
+  'stock_movements',
+  'recipes',
+  'recipe_items',
+  'suppliers',
+  'purchase_orders',
+  'purchase_order_items',
+  // Reservation — S8
+  'reservations',
+  // Landing page — S9
+  'landing_pages',
+  'landing_sections',
 ] as const

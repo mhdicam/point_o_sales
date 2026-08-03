@@ -52,16 +52,30 @@ import { IllegalTransitionError, EVENT_TYPES } from '@brewsync/shared'
 import { badRequest, conflict, notFound } from '../http-error.js'
 import { PriceService } from './price.service.js'
 import { orderStateMachine, isEditable, type OrderStatus } from './order.state.js'
+import { tableStateMachine, type TableStatus } from './table.state.js'
+import { classifyMergeCharges } from './table-ops.policy.js'
+import { routeLine } from './kds-routing.policy.js'
+import { FeatureService } from './feature.service.js'
+import { StockDeductionService } from './stock-deduction.service.js'
 import {
   runBillPipeline,
   type DiscountInput,
   type ItemDiscountInput,
   type FiscalConfig,
+  type PipelineInput,
   type PipelineLine,
 } from './order.pipeline.js'
 
 /** States in which the bill is still working state — discounts and recompute are legal. */
 const PRE_BILLED: ReadonlySet<OrderStatus> = new Set<OrderStatus>(['OPEN', 'SENT', 'SERVED'])
+
+/** States in which an order still physically occupies a table (transfer is legal). */
+const ORDER_ON_FLOOR: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  'OPEN',
+  'SENT',
+  'SERVED',
+  'BILLED',
+])
 
 type Tx = Prisma.TransactionClient
 
@@ -76,6 +90,12 @@ export interface CreateOrderInput {
   outletId: string
   channel?: 'STAFF' | 'QR_TABLE' | 'ONLINE'
   salesMethod?: string | null
+  /**
+   * Seat the new order at this table (§5.4): the table flips OCCUPIED and the
+   * `orders_one_per_table` index guarantees at most one active order per table.
+   * Used by the reservation seat→order flow (§15.3) and QR ordering (§16.2).
+   */
+  tableId?: string | null
   items?: OrderItemInput[]
 }
 
@@ -95,26 +115,58 @@ export class OrderService {
       throw badRequest('INVALID_QTY', 'Item quantity must be a positive integer.')
     }
 
-    return this.inTx(async (tx) => {
-      await this.requireOutlet(tx, input.outletId)
+    return this.inTx((tx) => this.createInTx(tx, input))
+  }
 
-      const order = await tx.order.create({
+  /**
+   * The tx-accepting core of `create` (§5.4). Exposed so a caller already inside
+   * a tenant transaction — the reservation seat → order handoff (§15.3) — can open
+   * the floor order without nesting a second transaction. Seats the table through
+   * the one seat seam when `tableId` is given.
+   */
+  async createInTx(tx: Tx, input: CreateOrderInput) {
+    if (input.items && input.items.some((i) => i.qty <= 0)) {
+      throw badRequest('INVALID_QTY', 'Item quantity must be a positive integer.')
+    }
+
+    await this.requireOutlet(tx, input.outletId)
+
+    // Seat the table first (§5.4): flips it OCCUPIED, asserting availability,
+    // before the order row claims it. The order create then trips the partial
+    // unique index if the table somehow already holds an active order.
+    if (input.tableId) {
+      const table = await this.requireTable(tx, input.tableId)
+      if (table.outletId !== input.outletId) {
+        throw badRequest('TABLE_WRONG_OUTLET', 'The table belongs to another outlet.')
+      }
+      await this.seatTable(tx, table)
+    }
+
+    let order: { id: string }
+    try {
+      order = await tx.order.create({
         data: {
           outletId: input.outletId,
           channel: input.channel ?? 'STAFF',
           salesMethod: input.salesMethod ?? null,
+          tableId: input.tableId ?? null,
           status: 'OPEN',
         } as unknown as Prisma.OrderCreateInput,
         select: { id: true },
       })
-
-      for (const item of input.items ?? []) {
-        await this.insertItem(tx, order.id, item)
+    } catch (err) {
+      if (input.tableId && this.isUniqueViolation(err)) {
+        throw conflict('TABLE_OCCUPIED', 'That table already has an active order.')
       }
+      throw err
+    }
 
-      await this.recompute(tx, order.id)
-      return this.load(tx, order.id)
-    })
+    for (const item of input.items ?? []) {
+      await this.insertItem(tx, order.id, item)
+    }
+
+    await this.recompute(tx, order.id)
+    return this.load(tx, order.id)
   }
 
   /** Adds a line. OPEN only (standard #7 — items freeze at SENT). */
@@ -167,11 +219,21 @@ export class OrderService {
    * edits to a variant or modifier never move this line.
    */
   async send(orderId: string) {
-    return this.inTx(async (tx) => {
-      const order = await this.requireOrder(tx, orderId)
-      this.assertTransition(order.status, 'SENT')
+    return this.inTx((tx) => this.sendInTx(tx, orderId))
+  }
 
-      const items = await tx.orderItem.findMany({
+  /**
+   * The tx-accepting core of `send` (mirrors the `createInTx` split). Exposed so a
+   * caller already inside a tenant transaction — QR order placement with
+   * auto-accept (§16.2) — can create-then-send in one transaction without nesting
+   * a second `$transaction`. Behaviour is identical to `send`.
+   */
+  async sendInTx(tx: Tx, orderId: string) {
+    const ctx = requireTenantContext()
+    const order = await this.requireOrder(tx, orderId)
+    this.assertTransition(order.status, 'SENT')
+
+    const items = await tx.orderItem.findMany({
         where: { orderId },
         select: { id: true, variantId: true, modifiersSnapshot: true },
       })
@@ -185,13 +247,55 @@ export class OrderService {
       })
       const variants = await tx.productVariant.findMany({
         where: { id: { in: variantIds } },
-        select: { id: true, name: true },
+        select: {
+          id: true,
+          name: true,
+          fulfillmentType: true,
+          product: {
+            select: {
+              fulfillmentType: true,
+              // The category's declared station is a *name* hint: Category is
+              // tenant-scoped while Station is outlet-owned, so the concrete
+              // station is resolved per-outlet by name at SENT (design §5.5).
+              category: { select: { defaultStation: { select: { name: true } } } },
+            },
+          },
+        },
       })
       const nameById = new Map(variants.map((v) => [v.id, v.name]))
+      const kdsEnabled = await new FeatureService(tx as unknown as BrewsyncClient).isEnabled('kds')
+
+      // Resolve the category station hint to a concrete station in THIS outlet by
+      // name. A hint with no same-named station here leaves the line unrouted
+      // (still QUEUED, on the unrouted lane) rather than pointing at a foreign
+      // outlet's station.
+      const outletStations = kdsEnabled
+        ? await tx.station.findMany({
+            where: { outletId: order.outletId, isActive: true },
+            select: { id: true, name: true },
+          })
+        : []
+      const stationIdByName = new Map(outletStations.map((s) => [s.name, s.id]))
+
+      // Effective fulfillment type (variant override ?? product default) + the
+      // station resolved for this outlet, per variant, for the KDS routing decision.
+      const routingByVariant = new Map(
+        variants.map((v) => {
+          const stationName = v.product.category?.defaultStation?.name ?? null
+          return [
+            v.id,
+            {
+              fulfillmentType: v.fulfillmentType ?? v.product.fulfillmentType,
+              defaultStationId: stationName ? (stationIdByName.get(stationName) ?? null) : null,
+            },
+          ]
+        })
+      )
 
       // Refreeze modifier deltas from current master (freeze AT sent, not at add).
       const modMap = await this.loadModifiers(tx, items.flatMap((i) => this.readModifierIds(i.modifiersSnapshot)))
 
+      let routedCount = 0
       for (const item of items) {
         const ids = this.readModifierIds(item.modifiersSnapshot)
         const chosen = ids.map((id) => modMap.get(id)).filter((m): m is NonNullable<typeof m> => m != null)
@@ -202,6 +306,10 @@ export class OrderService {
           priceDelta: m.priceDelta.toString(),
         }))
 
+        // Route to a KDS station (§5.5) — pure decision, applied here.
+        const routing = routeLine(kdsEnabled, routingByVariant.get(item.variantId)!)
+        if (routing.kdsStatus !== null) routedCount += 1
+
         await tx.orderItem.update({
           where: { id: item.id },
           data: {
@@ -209,6 +317,8 @@ export class OrderService {
             nameSnapshot: nameById.get(item.variantId) ?? '',
             modifierDeltaSnapshot: delta,
             modifiersSnapshot: snapshot as unknown as Prisma.InputJsonValue,
+            stationId: routing.stationId,
+            kdsStatus: routing.kdsStatus,
           },
         })
       }
@@ -218,9 +328,35 @@ export class OrderService {
         data: { status: 'SENT', sentAt: new Date() },
       })
 
+      // Stock deduction at SENT (§4.2) — a no-op unless the outlet deducts at
+      // SENT. Idempotent on ('order', orderId), so a redelivered send is safe.
+      await new StockDeductionService(tx as unknown as BrewsyncClient).deductForOrder(
+        tx,
+        {
+          id: orderId,
+          outletId: order.outletId,
+          items: await tx.orderItem.findMany({
+            where: { orderId },
+            select: { variantId: true, qty: true },
+          }),
+        },
+        'SENT',
+        ctx.userId ?? null
+      )
+
+      // Tell the kitchen board new tickets landed (S7-05) — only when something
+      // actually routed, so a pure-STOCKED order does not wake idle screens.
+      if (routedCount > 0) {
+        await emitEvent(tx as unknown as OutboxCapableTx, {
+          tenantId: ctx.tenantId,
+          outletId: order.outletId,
+          type: EVENT_TYPES.ORDER_SENT,
+          payload: { orderId, routedCount },
+        })
+      }
+
       await this.recompute(tx, orderId)
       return this.load(tx, orderId)
-    })
   }
 
   /** Marks a sent order delivered. SENT → SERVED. Pure bookkeeping; charges unaffected. */
@@ -250,14 +386,22 @@ export class OrderService {
   /** Applies an order-level discount (§6.4), against the running discounted subtotal. */
   async applyOrderDiscount(orderId: string, input: DiscountInput) {
     this.assertDiscountShape(input)
-    return this.inTx(async (tx) => {
-      const order = await this.requireOrder(tx, orderId)
-      this.assertPreBilled(order.status)
+    return this.inTx((tx) => this.applyOrderDiscountInTx(tx, orderId, input))
+  }
 
-      await this.seedDiscount(tx, orderId, input, null)
-      await this.recompute(tx, orderId)
-      return this.load(tx, orderId)
-    })
+  /**
+   * The tx-accepting core of `applyOrderDiscount`. Exposed so the reservation
+   * seat → order handoff (§15.3) can credit a deposit onto the fresh order within
+   * the same transaction, without nesting a second one.
+   */
+  async applyOrderDiscountInTx(tx: Tx, orderId: string, input: DiscountInput) {
+    this.assertDiscountShape(input)
+    const order = await this.requireOrder(tx, orderId)
+    this.assertPreBilled(order.status)
+
+    await this.seedDiscount(tx, orderId, input, null)
+    await this.recompute(tx, orderId)
+    return this.load(tx, orderId)
   }
 
   /** Sets (or clears, with 0) the gratuity — outside the total, never taxed (§6 step 7). */
@@ -290,9 +434,15 @@ export class OrderService {
   /**
    * Raises the bill. SENT/SERVED → BILLED.
    *
-   * One final recompute produces the authoritative rows, then the status flips —
-   * after which no mutation recomputes, so these rows are frozen (§7.1). Emits
-   * nothing: SaleCompleted is an S5 concern, at PAID.
+   * One final recompute produces the authoritative charge rows, then the status
+   * flips — after which no mutation recomputes, so those rows are frozen (§7.1).
+   * The same moment snapshots the money into a single `Bill` (seq 1): its `total`
+   * is `amountDue` (the §6 total plus gratuity — what the customer actually
+   * hands over), so a later master-data edit never shifts this bill (standard
+   * #7). Splitting into several bills is a separate S5 operation on top of this
+   * one; the single bill here satisfies SUM(bill.total) === order total trivially.
+   *
+   * Emits nothing: SaleCompleted is emitted at PAID by the payment path.
    */
   async bill(orderId: string) {
     return this.inTx(async (tx) => {
@@ -300,9 +450,21 @@ export class OrderService {
       this.assertTransition(order.status, 'BILLED')
 
       await this.recompute(tx, orderId)
+      const summary = await this.computeSummary(tx, orderId)
       await tx.order.update({
         where: { id: orderId },
         data: { status: 'BILLED', billedAt: new Date() },
+      })
+
+      // Idempotent on re-bill (the machine forbids re-entering BILLED, so this
+      // only ever inserts once): the single snapshot bill for the whole order.
+      await tx.bill.create({
+        data: {
+          orderId,
+          seq: 1,
+          subtotal: summary.subtotal,
+          total: summary.amountDue,
+        } as unknown as Prisma.BillCreateInput,
       })
       return this.load(tx, orderId)
     })
@@ -368,9 +530,200 @@ export class OrderService {
     })
   }
 
+  /**
+   * Transfers an order to a different table (§5.4). Moves `tableId`, seats the
+   * target (→ OCCUPIED) and frees the source (→ DIRTY). Legal for any order that
+   * still holds a table (pre-PAID); touches no money, so no recompute. The
+   * partial unique index `orders_one_per_table` is the backstop against seating a
+   * table that already has an active order — a P2002 there surfaces as 409.
+   */
+  async transfer(orderId: string, targetTableId: string) {
+    const ctx = requireTenantContext()
+    return this.inTx(async (tx) => {
+      const order = await this.requireOrder(tx, orderId)
+      if (!ORDER_ON_FLOOR.has(order.status)) {
+        throw conflict('ORDER_NOT_ON_FLOOR', `Order is ${order.status}; it no longer holds a table.`)
+      }
+      if (order.tableId === targetTableId) return this.load(tx, orderId)
+
+      const target = await this.requireTable(tx, targetTableId)
+      if (target.outletId !== order.outletId) {
+        throw badRequest('TABLE_WRONG_OUTLET', 'The target table belongs to another outlet.')
+      }
+
+      const sourceTableId = order.tableId
+      await this.seatTable(tx, target)
+      try {
+        await tx.order.update({ where: { id: orderId }, data: { tableId: targetTableId } })
+      } catch (err) {
+        if (this.isUniqueViolation(err)) {
+          throw conflict('TABLE_OCCUPIED', 'That table already has an active order.')
+        }
+        throw err
+      }
+      await this.freeTable(tx, sourceTableId)
+
+      await emitEvent(tx as unknown as OutboxCapableTx, {
+        tenantId: ctx.tenantId,
+        outletId: order.outletId,
+        type: EVENT_TYPES.ORDER_TRANSFERRED,
+        payload: { orderId, fromTableId: sourceTableId, toTableId: targetTableId },
+      })
+      return this.load(tx, orderId)
+    })
+  }
+
+  /**
+   * Merges the `absorbedOrderId` into the `survivorOrderId` (§5.4): the absorbed
+   * order's items (and their item-level discounts) move to the survivor, the
+   * absorbed order is VOIDed and its table freed. Per the approved policy, the
+   * absorbed order's ORDER-level discount and gratuity are DROPPED — their basis
+   * (the vanished subtotal/total) no longer applies — and returned as warnings so
+   * the UI can tell the cashier.
+   *
+   * Both orders must be pre-BILLED (charges are working state) and on the same
+   * side of the SENT boundary (standard #7): mixing a live-priced OPEN order with
+   * a snapshot-frozen SENT order would let the survivor's pricing regime silently
+   * re-price the moved lines. Same outlet, and not the same order.
+   */
+  async merge(survivorOrderId: string, absorbedOrderId: string) {
+    const ctx = requireTenantContext()
+    if (survivorOrderId === absorbedOrderId) {
+      throw badRequest('MERGE_SELF', 'An order cannot be merged into itself.')
+    }
+    return this.inTx(async (tx) => {
+      const survivor = await this.requireOrder(tx, survivorOrderId)
+      const absorbed = await this.requireOrder(tx, absorbedOrderId)
+      this.assertPreBilled(survivor.status)
+      this.assertPreBilled(absorbed.status)
+      this.assertSameOutlet(survivor, absorbed)
+      this.assertSamePricingEpoch(survivor, absorbed)
+
+      // Classify the absorbed order's charges: item discounts travel, order
+      // discount + gratuity are dropped (with warnings), derived rows recomputed.
+      const absorbedCharges = await tx.orderCharge.findMany({
+        where: { orderId: absorbedOrderId },
+        select: { kind: true, label: true, amount: true, orderItemId: true },
+      })
+      const { itemDiscountIds, warnings } = classifyMergeCharges(
+        absorbedCharges.map((c) => ({
+          kind: c.kind as 'DISCOUNT' | 'SERVICE_CHARGE' | 'TAX' | 'ROUNDING' | 'GRATUITY',
+          label: c.label,
+          amount: c.amount.toString(),
+          orderItemId: c.orderItemId,
+        }))
+      )
+
+      // Move items to the survivor. Their snapshots (frozen or empty) travel with
+      // them unchanged; the same-epoch guard keeps recompute consistent.
+      const movedItems = await tx.orderItem.findMany({
+        where: { orderId: absorbedOrderId },
+        select: { id: true },
+      })
+      await tx.orderItem.updateMany({
+        where: { orderId: absorbedOrderId },
+        data: { orderId: survivorOrderId } as unknown as Prisma.OrderItemUpdateManyMutationInput,
+      })
+      // Reparent the surviving item discounts (order-level rows are left to be
+      // deleted with the absorbed order below).
+      if (itemDiscountIds.length > 0) {
+        await tx.orderCharge.updateMany({
+          where: { orderId: absorbedOrderId, orderItemId: { in: itemDiscountIds } },
+          data: { orderId: survivorOrderId } as unknown as Prisma.OrderChargeUpdateManyMutationInput,
+        })
+      }
+      // The absorbed order's remaining charges (order discount, gratuity, derived)
+      // are dropped; delete them before voiding.
+      await tx.orderCharge.deleteMany({ where: { orderId: absorbedOrderId } })
+
+      // Void the now-empty absorbed order and free its table.
+      this.assertTransition(absorbed.status, 'VOID')
+      await tx.order.update({
+        where: { id: absorbedOrderId },
+        data: { status: 'VOID', tableId: null },
+      })
+      await this.freeTable(tx, absorbed.tableId)
+
+      await emitEvent(tx as unknown as OutboxCapableTx, {
+        tenantId: ctx.tenantId,
+        outletId: survivor.outletId,
+        type: EVENT_TYPES.ORDER_MERGED,
+        payload: {
+          survivorOrderId,
+          absorbedOrderId,
+          movedItemCount: movedItems.length,
+          droppedCharges: warnings,
+        },
+      })
+
+      await this.recompute(tx, survivorOrderId)
+      const order = await this.load(tx, survivorOrderId)
+      return { order, warnings }
+    })
+  }
+
+  /**
+   * Moves a subset of items from one order to another (§5.4) — e.g. splitting a
+   * table's shared line onto a separate bill. Item-level discounts travel with
+   * their line; order-level charges on either side recompute against the new
+   * subtotals. Both orders must be pre-BILLED, same outlet, same pricing epoch.
+   * The source order is left as-is even if it ends up empty (the cashier decides
+   * whether to void it).
+   */
+  async moveItems(fromOrderId: string, toOrderId: string, orderItemIds: string[]) {
+    const ctx = requireTenantContext()
+    if (fromOrderId === toOrderId) {
+      throw badRequest('MOVE_SELF', 'Source and target orders must differ.')
+    }
+    if (orderItemIds.length === 0) {
+      throw badRequest('MOVE_EMPTY', 'Select at least one item to move.')
+    }
+    return this.inTx(async (tx) => {
+      const from = await this.requireOrder(tx, fromOrderId)
+      const to = await this.requireOrder(tx, toOrderId)
+      this.assertPreBilled(from.status)
+      this.assertPreBilled(to.status)
+      this.assertSameOutlet(from, to)
+      this.assertSamePricingEpoch(from, to)
+
+      // Every id must belong to the source order.
+      const items = await tx.orderItem.findMany({
+        where: { id: { in: orderItemIds }, orderId: fromOrderId },
+        select: { id: true },
+      })
+      if (items.length !== orderItemIds.length) {
+        throw notFound('ORDER_ITEM_NOT_FOUND', 'One or more items do not belong to the source order.')
+      }
+
+      await tx.orderItem.updateMany({
+        where: { id: { in: orderItemIds }, orderId: fromOrderId },
+        data: { orderId: toOrderId } as unknown as Prisma.OrderItemUpdateManyMutationInput,
+      })
+      // Item discounts follow their line.
+      await tx.orderCharge.updateMany({
+        where: { orderId: fromOrderId, orderItemId: { in: orderItemIds } },
+        data: { orderId: toOrderId } as unknown as Prisma.OrderChargeUpdateManyMutationInput,
+      })
+
+      await emitEvent(tx as unknown as OutboxCapableTx, {
+        tenantId: ctx.tenantId,
+        outletId: from.outletId,
+        type: EVENT_TYPES.ITEMS_MOVED,
+        payload: { fromOrderId, toOrderId, orderItemIds },
+      })
+
+      await this.recompute(tx, fromOrderId)
+      await this.recompute(tx, toOrderId)
+      return {
+        from: await this.load(tx, fromOrderId),
+        to: await this.load(tx, toOrderId),
+      }
+    })
+  }
+
   /** Reads one order with its lines and charge breakdown. */
   async getById(orderId: string) {
-    const order = await this.load(this.db, orderId)
+    const order = await this.load(this.db as unknown as Tx, orderId)
     if (!order) throw notFound('ORDER_NOT_FOUND', `Order ${orderId} not found.`)
     return order
   }
@@ -400,82 +753,8 @@ export class OrderService {
    * pipeline, then rewrites the full breakdown. Never called after BILLED.
    */
   private async recompute(tx: Tx, orderId: string): Promise<void> {
-    const order = await tx.order.findUniqueOrThrow({
-      where: { id: orderId },
-      select: { outletId: true, salesMethod: true, sentAt: true },
-    })
-    const items = await tx.orderItem.findMany({
-      where: { orderId },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-      select: {
-        id: true,
-        variantId: true,
-        qty: true,
-        priceSnapshot: true,
-        modifierDeltaSnapshot: true,
-      },
-    })
-    const existing = await tx.orderCharge.findMany({
-      where: { orderId },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-      select: { kind: true, label: true, rateBp: true, amount: true, orderItemId: true },
-    })
-
-    // Step 1 inputs — line subtotals. Live price while OPEN; frozen snapshot after SENT.
-    let lines: PipelineLine[]
-    if (order.sentAt === null) {
-      const priceSvc = new PriceService(tx as unknown as BrewsyncClient)
-      const prices = await priceSvc.resolveMany(items.map((i) => i.variantId), {
-        outletId: order.outletId,
-        salesMethod: order.salesMethod,
-      })
-      lines = items.map((i) => ({
-        subtotalMinor: (prices.get(i.variantId)!.price + i.modifierDeltaSnapshot) * BigInt(i.qty),
-      }))
-    } else {
-      lines = items.map((i) => ({
-        subtotalMinor: (i.priceSnapshot + i.modifierDeltaSnapshot) * BigInt(i.qty),
-      }))
-    }
-
-    // Reconstruct discounts from the durable DISCOUNT rows, preserving apply order.
-    const indexById = new Map(items.map((it, idx) => [it.id, idx]))
-    const itemDiscounts: ItemDiscountInput[] = []
-    const orderDiscounts: DiscountInput[] = []
-    for (const c of existing) {
-      if (c.kind !== 'DISCOUNT') continue
-      const magnitude = c.amount < 0n ? -c.amount : c.amount
-      const base: DiscountInput =
-        c.rateBp !== null ? { label: c.label, rateBp: c.rateBp } : { label: c.label, amountMinor: magnitude }
-      if (c.orderItemId !== null) {
-        const lineIndex = indexById.get(c.orderItemId)
-        if (lineIndex === undefined) continue // line gone; discount is moot
-        itemDiscounts.push({ ...base, lineIndex })
-      } else {
-        orderDiscounts.push(base)
-      }
-    }
-
-    const gratuityRow = existing.find((c) => c.kind === 'GRATUITY')
-    const gratuityMinor = gratuityRow ? (gratuityRow.amount < 0n ? -gratuityRow.amount : gratuityRow.amount) : 0n
-
-    const outlet = await tx.outlet.findUniqueOrThrow({
-      where: { id: order.outletId },
-      select: {
-        taxInclusive: true,
-        taxRateBp: true,
-        serviceChargeRateBp: true,
-        roundingIncrement: true,
-      },
-    })
-    const fiscal: FiscalConfig = {
-      taxInclusive: outlet.taxInclusive,
-      taxRateBp: outlet.taxRateBp,
-      serviceChargeRateBp: outlet.serviceChargeRateBp,
-      roundingIncrement: outlet.roundingIncrement,
-    }
-
-    const result = runBillPipeline({ lines, fiscal, itemDiscounts, orderDiscounts, gratuityMinor })
+    const { pipelineInput, items, itemDiscounts } = await this.gatherPipeline(tx, orderId)
+    const result = runBillPipeline(pipelineInput)
 
     // Re-associate item discounts to their line. The pipeline emits item
     // discounts (in input order) before order discounts, so the k-th DISCOUNT
@@ -507,6 +786,115 @@ export class OrderService {
       await tx.orderCharge.createMany({
         data: rows as unknown as Prisma.OrderChargeCreateManyInput[],
       })
+    }
+  }
+
+  /**
+   * Assembles the pure pipeline inputs from persisted state — the single seam
+   * shared by the write path (`recompute`, which rewrites the charge rows) and
+   * the read path (`computeSummary`, which derives the summary for `load`).
+   * Keeping it in one place is what guarantees the total a client is shown is the
+   * total that gets persisted: both run identical inputs through the same pipeline.
+   *
+   * Line prices are live through `PriceService` while OPEN (sentAt null) and read
+   * from the frozen `priceSnapshot` after SENT (standard #7). Discounts and
+   * gratuity are reconstructed from their durable `OrderCharge` rows.
+   */
+  private async gatherPipeline(
+    client: Tx,
+    orderId: string
+  ): Promise<{
+    pipelineInput: PipelineInput
+    items: { id: string; unitPriceMinor: bigint; lineSubtotalMinor: bigint }[]
+    itemDiscounts: ItemDiscountInput[]
+  }> {
+    const order = await client.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { outletId: true, salesMethod: true, sentAt: true },
+    })
+    const items = await client.orderItem.findMany({
+      where: { orderId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        variantId: true,
+        qty: true,
+        priceSnapshot: true,
+        modifierDeltaSnapshot: true,
+      },
+    })
+    const existing = await client.orderCharge.findMany({
+      where: { orderId },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: { kind: true, label: true, rateBp: true, amount: true, orderItemId: true },
+    })
+
+    // Step 1 inputs — unit price then line subtotal. Live price while OPEN;
+    // frozen snapshot after SENT. `unitPriceMinor` includes the modifier delta so
+    // the FE can show a meaningful per-line price without any money math.
+    let unitPriceOf: (item: (typeof items)[number]) => bigint
+    if (order.sentAt === null) {
+      const priceSvc = new PriceService(client as unknown as BrewsyncClient)
+      const prices = await priceSvc.resolveMany(items.map((i) => i.variantId), {
+        outletId: order.outletId,
+        salesMethod: order.salesMethod,
+      })
+      unitPriceOf = (i) => prices.get(i.variantId)!.price + i.modifierDeltaSnapshot
+    } else {
+      unitPriceOf = (i) => i.priceSnapshot + i.modifierDeltaSnapshot
+    }
+
+    const priced = items.map((i) => {
+      const unitPriceMinor = unitPriceOf(i)
+      return {
+        id: i.id,
+        unitPriceMinor,
+        lineSubtotalMinor: unitPriceMinor * BigInt(i.qty),
+      }
+    })
+    const lines: PipelineLine[] = priced.map((p) => ({ subtotalMinor: p.lineSubtotalMinor }))
+
+    // Reconstruct discounts from the durable DISCOUNT rows, preserving apply order.
+    const indexById = new Map(items.map((it, idx) => [it.id, idx]))
+    const itemDiscounts: ItemDiscountInput[] = []
+    const orderDiscounts: DiscountInput[] = []
+    for (const c of existing) {
+      if (c.kind !== 'DISCOUNT') continue
+      const magnitude = c.amount < 0n ? -c.amount : c.amount
+      const base: DiscountInput =
+        c.rateBp !== null ? { label: c.label, rateBp: c.rateBp } : { label: c.label, amountMinor: magnitude }
+      if (c.orderItemId !== null) {
+        const lineIndex = indexById.get(c.orderItemId)
+        if (lineIndex === undefined) continue // line gone; discount is moot
+        itemDiscounts.push({ ...base, lineIndex })
+      } else {
+        orderDiscounts.push(base)
+      }
+    }
+
+    const gratuityRow = existing.find((c) => c.kind === 'GRATUITY')
+    const gratuityMinor = gratuityRow ? (gratuityRow.amount < 0n ? -gratuityRow.amount : gratuityRow.amount) : 0n
+
+    const outlet = await client.outlet.findUniqueOrThrow({
+      where: { id: order.outletId },
+      select: {
+        taxInclusive: true,
+        taxRateBp: true,
+        serviceChargeRateBp: true,
+        roundingIncrement: true,
+      },
+    })
+    const fiscal: FiscalConfig = {
+      taxInclusive: outlet.taxInclusive,
+      taxRateBp: outlet.taxRateBp,
+      serviceChargeRateBp: outlet.serviceChargeRateBp,
+      roundingIncrement: outlet.roundingIncrement,
+    }
+
+    return {
+      pipelineInput: { lines, fiscal, itemDiscounts, orderDiscounts, gratuityMinor },
+      items: priced,
+      itemDiscounts,
     }
   }
 
@@ -589,23 +977,122 @@ export class OrderService {
       .filter((id): id is string => typeof id === 'string')
   }
 
-  private async load(client: Tx | BrewsyncClient, orderId: string) {
-    return client.order.findUnique({
+  /**
+   * Reads one order with its lines, charge breakdown, and a derived money
+   * summary.
+   *
+   * The persisted rows carry the *breakdown* but not a subtotal/total, and while
+   * OPEN a line's `priceSnapshot` is still zero (it freezes at SENT). The cashier
+   * screen nonetheless needs a running total and per-line prices as it builds the
+   * order. So `load` re-runs the same pure pipeline on read (`computeSummary`) —
+   * deterministic on frozen inputs post-SENT, live-priced while OPEN — and folds
+   * `unitPrice`/`lineSubtotal` onto each item plus a `summary`. Every amount stays
+   * a BigInt, so the money never becomes a float and the wire carries decimal
+   * strings (standard #2). The FE renders these rows; it does no money math.
+   */
+  private async load(client: Tx, orderId: string) {
+    const order = await client.order.findUnique({
       where: { id: orderId },
       include: {
         items: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
         charges: { orderBy: { sortOrder: 'asc' } },
+        bills: {
+          orderBy: { seq: 'asc' },
+          include: { payments: { orderBy: { createdAt: 'asc' } } },
+        },
       },
     })
+    if (!order) return null
+
+    const summary = await this.computeSummary(client, orderId)
+    const priceByItem = new Map(summary.lines.map((l) => [l.id, l]))
+    return {
+      ...order,
+      items: order.items.map((item) => {
+        const line = priceByItem.get(item.id)
+        return {
+          ...item,
+          unitPrice: line?.unitPriceMinor ?? 0n,
+          lineSubtotal: line?.lineSubtotalMinor ?? 0n,
+        }
+      }),
+      summary: {
+        subtotal: summary.subtotal,
+        total: summary.total,
+        amountDue: summary.amountDue,
+        taxContributesToTotal: summary.taxContributesToTotal,
+      },
+    }
+  }
+
+  /**
+   * Runs the pipeline as a pure read — no charge rewrite — to derive the
+   * subtotal/total/amountDue and per-line display prices for `load`. Shares
+   * `gatherPipeline` with `recompute`, so the numbers a client sees are computed
+   * by exactly the same code that persists the charges: they cannot drift.
+   */
+  private async computeSummary(client: Tx, orderId: string) {
+    const gathered = await this.gatherPipeline(client, orderId)
+    const result = runBillPipeline(gathered.pipelineInput)
+    return {
+      lines: gathered.items,
+      subtotal: result.subtotal as bigint,
+      total: result.total as bigint,
+      amountDue: result.amountDue as bigint,
+      taxContributesToTotal: result.taxContributesToTotal,
+    }
   }
 
   private async requireOrder(tx: Tx, orderId: string) {
     const order = await tx.order.findUnique({
       where: { id: orderId },
-      select: { id: true, status: true, outletId: true, salesMethod: true },
+      select: {
+        id: true,
+        status: true,
+        outletId: true,
+        salesMethod: true,
+        tableId: true,
+        sentAt: true,
+      },
     })
     if (!order) throw notFound('ORDER_NOT_FOUND', `Order ${orderId} not found.`)
     return { ...order, status: order.status as OrderStatus }
+  }
+
+  /** Loads a table and asserts it exists (floor operations, §5.4). */
+  private async requireTable(tx: Tx, tableId: string) {
+    const table = await tx.table.findUnique({
+      where: { id: tableId },
+      select: { id: true, outletId: true, status: true, isActive: true },
+    })
+    if (!table) throw notFound('TABLE_NOT_FOUND', `Table ${tableId} not found.`)
+    return { ...table, status: table.status as TableStatus }
+  }
+
+  /**
+   * Frees a table an order is leaving: OCCUPIED → DIRTY (needs bussing before
+   * reseat, §5.4). Silently skips a table that is not currently OCCUPIED, so a
+   * double transfer or a race cannot throw an illegal-transition here.
+   */
+  private async freeTable(tx: Tx, tableId: string | null): Promise<void> {
+    if (!tableId) return
+    const table = await this.requireTable(tx, tableId)
+    if (table.status === 'OCCUPIED') {
+      await tx.table.update({ where: { id: tableId }, data: { status: 'DIRTY' } })
+    }
+  }
+
+  /** Seats an order at a table: asserts the table can take it, flips it OCCUPIED. */
+  private async seatTable(tx: Tx, table: { id: string; status: TableStatus }): Promise<void> {
+    try {
+      tableStateMachine.assert(table.status, 'OCCUPIED')
+    } catch (err) {
+      if (err instanceof IllegalTransitionError) {
+        throw conflict('TABLE_NOT_AVAILABLE', `Table is ${table.status}; it cannot be seated.`)
+      }
+      throw err
+    }
+    await tx.table.update({ where: { id: table.id }, data: { status: 'OCCUPIED' } })
   }
 
   private async requireItem(tx: Tx, orderId: string, orderItemId: string): Promise<void> {
@@ -633,6 +1120,37 @@ export class OrderService {
     if (!PRE_BILLED.has(status)) {
       throw conflict('ORDER_FROZEN', `Order is ${status}; charges are frozen once BILLED.`)
     }
+  }
+
+  /** Both orders in a merge / move must live in the same outlet (§5.4). */
+  private assertSameOutlet(a: { outletId: string }, b: { outletId: string }): void {
+    if (a.outletId !== b.outletId) {
+      throw badRequest('CROSS_OUTLET', 'Both orders must belong to the same outlet.')
+    }
+  }
+
+  /**
+   * Both orders must be on the same side of the SENT snapshot boundary (standard
+   * #7). Moving a line between a live-priced order (sentAt null) and a
+   * snapshot-frozen one would let the target's pricing regime silently re-price
+   * it. `gatherPipeline` keys its live/frozen decision on the *order's* sentAt, so
+   * the invariant is one epoch per order — enforce it before any item moves.
+   */
+  private assertSamePricingEpoch(
+    a: { sentAt: Date | null },
+    b: { sentAt: Date | null }
+  ): void {
+    if ((a.sentAt === null) !== (b.sentAt === null)) {
+      throw conflict(
+        'PRICING_EPOCH_MISMATCH',
+        'One order is still open (live-priced) and the other is sent (frozen); they cannot be combined.'
+      )
+    }
+  }
+
+  /** True for a Prisma P2002 unique-constraint violation (e.g. one-order-per-table). */
+  private isUniqueViolation(err: unknown): boolean {
+    return typeof err === 'object' && err !== null && (err as { code?: string }).code === 'P2002'
   }
 
   /** Asserts a transition, translating the machine's error to HTTP 409. */

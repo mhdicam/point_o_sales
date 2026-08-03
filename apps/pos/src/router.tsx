@@ -34,6 +34,33 @@ const ModifiersScreen = lazy(() =>
 const PriceListsScreen = lazy(() =>
   import('./routes/PriceListsScreen.tsx').then((m) => ({ default: m.PriceListsScreen }))
 )
+const SuppliersScreen = lazy(() =>
+  import('./routes/SuppliersScreen.tsx').then((m) => ({ default: m.SuppliersScreen }))
+)
+const InventoryScreen = lazy(() =>
+  import('./routes/InventoryScreen.tsx').then((m) => ({ default: m.InventoryScreen }))
+)
+const PurchaseOrdersScreen = lazy(() =>
+  import('./routes/PurchaseOrdersScreen.tsx').then((m) => ({ default: m.PurchaseOrdersScreen }))
+)
+const OrderScreen = lazy(() =>
+  import('./routes/order/OrderScreen.tsx').then((m) => ({ default: m.OrderScreen }))
+)
+const PaymentScreen = lazy(() =>
+  import('./routes/payment/PaymentScreen.tsx').then((m) => ({ default: m.PaymentScreen }))
+)
+const ShiftScreen = lazy(() =>
+  import('./routes/shift/ShiftScreen.tsx').then((m) => ({ default: m.ShiftScreen }))
+)
+const FloorPlanScreen = lazy(() =>
+  import('./routes/floor/FloorPlanScreen.tsx').then((m) => ({ default: m.FloorPlanScreen }))
+)
+const KdsBoardScreen = lazy(() =>
+  import('./routes/kds/KdsBoardScreen.tsx').then((m) => ({ default: m.KdsBoardScreen }))
+)
+const LandingAdminScreen = lazy(() =>
+  import('./routes/LandingAdminScreen.tsx').then((m) => ({ default: m.LandingAdminScreen }))
+)
 
 function Lazy({ children }: { children: ReactNode }): ReactNode {
   return <Suspense fallback={<Spinner />}>{children}</Suspense>
@@ -48,11 +75,20 @@ export const router: RouterProviderProps['router'] = createBrowserRouter([
     children: [
       { element: <AdminLayout />, children: [
         { index: true, element: <Navigate to="products" replace /> },
+        { path: 'order', element: <Lazy><OrderScreen /></Lazy> },
+        { path: 'pay/:orderId', element: <Lazy><PaymentScreen /></Lazy> },
+        { path: 'shift', element: <Lazy><ShiftScreen /></Lazy> },
+        { path: 'floor', element: <Lazy><FloorPlanScreen /></Lazy> },
+        { path: 'kds', element: <Lazy><KdsBoardScreen /></Lazy> },
         { path: 'products', element: <Lazy><ProductsScreen /></Lazy> },
         { path: 'categories', element: <Lazy><CategoriesScreen /></Lazy> },
         { path: 'units', element: <Lazy><UnitsScreen /></Lazy> },
         { path: 'modifiers', element: <Lazy><ModifiersScreen /></Lazy> },
         { path: 'prices', element: <Lazy><PriceListsScreen /></Lazy> },
+        { path: 'suppliers', element: <Lazy><SuppliersScreen /></Lazy> },
+        { path: 'inventory', element: <Lazy><InventoryScreen /></Lazy> },
+        { path: 'purchase-orders', element: <Lazy><PurchaseOrdersScreen /></Lazy> },
+        { path: 'landing', element: <Lazy><LandingAdminScreen /></Lazy> },
       ] },
     ],
   },
