@@ -57,12 +57,16 @@ export function createKdsRouter(db: BrewsyncClient): Router {
   const requirePermission = createPermissionMiddleware(db)
   const requireFeature = createFeatureMiddleware(db)
 
-  // KDS feature gates every route below.
-  router.use(requireFeature('kds'))
+  // KDS feature gates every route below. Applied per-route rather than via
+  // `router.use`, because this router is mounted at '/' (its routes live at
+  // /stations and /kds/*, which share no common prefix). A blanket router-level
+  // guard would run for EVERY request the app receives — a kds-off tenant would
+  // then get FEATURE_DISABLED on unrelated endpoints like /orders.
+  const requireKds = requireFeature('kds')
 
   // --- Stations (config) ---------------------------------------------------
 
-  router.get('/stations', requirePermission(PERMISSIONS.STATION_MANAGE), async (req, res, next) => {
+  router.get('/stations', requireKds, requirePermission(PERMISSIONS.STATION_MANAGE), async (req, res, next) => {
     try {
       const list = await stations.list(parseOutletId(req.query['outletId']), {
         includeInactive: req.query['includeInactive'] === 'true',
@@ -73,7 +77,7 @@ export function createKdsRouter(db: BrewsyncClient): Router {
     }
   })
 
-  router.post('/stations', requirePermission(PERMISSIONS.STATION_MANAGE), async (req, res, next) => {
+  router.post('/stations', requireKds, requirePermission(PERMISSIONS.STATION_MANAGE), async (req, res, next) => {
     try {
       const parsed = createStationSchema.safeParse(req.body)
       if (!parsed.success) {
@@ -88,6 +92,7 @@ export function createKdsRouter(db: BrewsyncClient): Router {
 
   router.put(
     '/stations/:id',
+    requireKds,
     requirePermission(PERMISSIONS.STATION_MANAGE),
     async (req, res, next) => {
       try {
@@ -105,6 +110,7 @@ export function createKdsRouter(db: BrewsyncClient): Router {
 
   router.delete(
     '/stations/:id',
+    requireKds,
     requirePermission(PERMISSIONS.STATION_MANAGE),
     async (req, res, next) => {
       try {
@@ -118,7 +124,7 @@ export function createKdsRouter(db: BrewsyncClient): Router {
 
   // --- Board (kitchen) -----------------------------------------------------
 
-  router.get('/kds/board', requirePermission(PERMISSIONS.KDS_BUMP), async (req, res, next) => {
+  router.get('/kds/board', requireKds, requirePermission(PERMISSIONS.KDS_BUMP), async (req, res, next) => {
     try {
       const board = await kds.board(parseOutletId(req.query['outletId']))
       res.json(board)
@@ -129,6 +135,7 @@ export function createKdsRouter(db: BrewsyncClient): Router {
 
   router.post(
     '/kds/items/:id/status',
+    requireKds,
     requirePermission(PERMISSIONS.KDS_BUMP),
     async (req, res, next) => {
       try {

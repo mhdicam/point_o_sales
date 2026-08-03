@@ -151,7 +151,9 @@ export function createApp(
   app.use('/sales-methods', createSalesMethodRouter(db))
   // S7-02 — floor plan: areas + tables (gated on the `tables` feature).
   app.use('/floor-plan', createFloorPlanRouter(db))
-  // S7-04 — stations + KDS board (gated on the `kds` feature).
+  // S7-04 — stations + KDS board. Mounted at '/' because its routes (/stations,
+  // /kds/*) share no prefix; the `kds` feature is guarded per-route (not via a
+  // router-level `use`, which at this mount would gate the entire app).
   app.use('/', createKdsRouter(db))
   // S6-01 — stock ledger: on-hand, inventory-card history, stock-take adjust.
   app.use('/inventory', createStockRouter(db))
