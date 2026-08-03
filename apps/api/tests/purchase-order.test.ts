@@ -32,7 +32,15 @@ import { StockService } from '../src/services/stock.service.js'
 loadEnv({ path: resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
 
 const APP_ROLE_URL = process.env.TEST_DATABASE_URL!
-const OWNER_ROLE_URL = process.env.TEST_DIRECT_DATABASE_URL!
+const OWNER_ROLE_URL = withConnectionLimitOne(process.env.TEST_DIRECT_DATABASE_URL!)
+
+/**
+ * Pin the owner client to one connection so a session-level GUC persists across
+ * the raw fixture inserts (and the raw outbox read in the assertions below).
+ */
+function withConnectionLimitOne(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}connection_limit=1`
+}
 
 // One base unit, scaled — the qty helper's unit. Keeps the fixtures readable.
 const SCALE = 1_000_000n
@@ -64,6 +72,11 @@ describe('S6-06 — purchase order', () => {
       `
       tenantId = tenant!.id
 
+      // RLS is FORCEd, so even the owner is subject to it. The owner client is
+      // pinned to one connection, so this session-level GUC stays bound across
+      // every tenant-scoped insert below (and the raw outbox read in a test).
+      await dbOwner.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, false)`, tenantId)
+
       const [outlet] = await dbOwner.$queryRaw<Array<{ id: string }>>`
         INSERT INTO outlets (id, "tenantId", code, name, status, "updatedAt")
         VALUES (gen_random_uuid(), ${tenantId}::uuid, 'MAIN', 'Main', 'ACTIVE', now())
@@ -79,8 +92,8 @@ describe('S6-06 — purchase order', () => {
       supplierId = supplier!.id
 
       const [product] = await dbOwner.$queryRaw<Array<{ id: string }>>`
-        INSERT INTO products (id, "tenantId", name, "fulfillmentType", "isActive", "updatedAt")
-        VALUES (gen_random_uuid(), ${tenantId}::uuid, 'Beans', 'STOCKED', true, now())
+        INSERT INTO products (id, "tenantId", name, slug, "fulfillmentType", "isActive", "updatedAt")
+        VALUES (gen_random_uuid(), ${tenantId}::uuid, 'Beans', ${`beans-${runId}`}, 'STOCKED', true, now())
         RETURNING id
       `
       const productId = product!.id
@@ -168,8 +181,9 @@ describe('S6-06 — purchase order', () => {
         items: [{ variantId: variantA, qtyOrderedScaled: 1n * SCALE, unitCost: 1_000n }],
       })
     )
-    // Never SUBMITTED — the machine forbids DRAFT → APPROVED.
-    await expect(asTenant(() => pos.approve(draft.id))).rejects.toThrow(/ILLEGAL_TRANSITION|transition/i)
+    // Never SUBMITTED — the machine forbids DRAFT → APPROVED. The service maps
+    // IllegalTransitionError to a 409 reading "cannot move from DRAFT to APPROVED…".
+    await expect(asTenant(() => pos.approve(draft.id))).rejects.toThrow(/cannot move from|Allowed from/i)
   })
 
   it('requires a reason to cancel', async () => {

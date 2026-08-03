@@ -93,10 +93,11 @@ describe('S8-06 — QR order flow', () => {
       VALUES (gen_random_uuid(), ${tenantId}::uuid, 'FNB', ${JSON.stringify(QR_FEATURES)}::jsonb, now())
     `
 
-    // Zero tax + no rounding so the bill pipeline accepts the QR order.
+    // Zero tax + rounding increment 1 (== no rounding; 0 is an invalid
+    // increment the pipeline rejects) so the bill pipeline accepts the QR order.
     const [outlet] = await dbOwner.$queryRaw<Array<{ id: string }>>`
       INSERT INTO outlets (id, "tenantId", code, name, status, "taxRateBp", "roundingIncrement", "updatedAt")
-      VALUES (gen_random_uuid(), ${tenantId}::uuid, 'MAIN', 'Main', 'ACTIVE', 0, 0, now())
+      VALUES (gen_random_uuid(), ${tenantId}::uuid, 'MAIN', 'Main', 'ACTIVE', 0, 1, now())
       RETURNING id
     `
     outletId = outlet!.id

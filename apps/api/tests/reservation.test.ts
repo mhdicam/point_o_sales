@@ -27,7 +27,15 @@ import { ReservationService } from '../src/services/reservation.service.js'
 loadEnv({ path: resolvePath(dirname(fileURLToPath(import.meta.url)), '../../../.env') })
 
 const APP_ROLE_URL = process.env.TEST_DATABASE_URL!
-const OWNER_ROLE_URL = process.env.TEST_DIRECT_DATABASE_URL!
+const OWNER_ROLE_URL = withConnectionLimitOne(process.env.TEST_DIRECT_DATABASE_URL!)
+
+/**
+ * Pin the owner client to one connection so a session-level GUC persists across
+ * the raw fixture inserts (and the raw reads in the assertions below).
+ */
+function withConnectionLimitOne(url: string): string {
+  return `${url}${url.includes('?') ? '&' : '?'}connection_limit=1`
+}
 
 describe('S8 — reservation', () => {
   const dbApp = createPrismaClient({ datasourceUrl: APP_ROLE_URL })
@@ -52,6 +60,11 @@ describe('S8 — reservation', () => {
       `
       tenantId = tenant!.id
 
+      // RLS is FORCEd, so even the owner is subject to it. The owner client is
+      // pinned to one connection, so this session-level GUC stays bound across
+      // every tenant-scoped insert below (and the raw reads in the assertions).
+      await dbOwner.$executeRawUnsafe(`SELECT set_config('app.current_tenant', $1, false)`, tenantId)
+
       const [outlet] = await dbOwner.$queryRaw<Array<{ id: string }>>`
         INSERT INTO outlets (id, "tenantId", code, name, status, "updatedAt")
         VALUES (gen_random_uuid(), ${tenantId}::uuid, 'MAIN', 'Main', 'ACTIVE', now())
@@ -60,9 +73,11 @@ describe('S8 — reservation', () => {
       outletId = outlet!.id
 
       // Seating a reservation creates an Order, which requires an outlet with
-      // fiscal defaults — set them so the bill pipeline doesn't reject.
+      // fiscal defaults — set them so the bill pipeline doesn't reject. Rounding
+      // increment 1 means "no rounding" (0 is an invalid increment the pipeline
+      // rejects).
       await dbOwner.$executeRaw`
-        UPDATE outlets SET "taxRateBp" = 0, "roundingIncrement" = 0 WHERE id = ${outletId}::uuid
+        UPDATE outlets SET "taxRateBp" = 0, "roundingIncrement" = 1 WHERE id = ${outletId}::uuid
       `
 
       const tables = await dbOwner.$queryRaw<Array<{ id: string }>>`
@@ -202,7 +217,10 @@ describe('S8 — reservation', () => {
   })
 
   it('no-shows a CONFIRMED booking and it cannot be seated after', async () => {
-    const arrival = new Date(Date.now() + 14_400_000) // 4 hours from now
+    // A window on tableA past every other confirmed booking in this file — the
+    // back-to-back case leaves a confirmed [+4h, +6h) hold on tableA, so this
+    // sits at +8h to avoid a spurious overlap rejection on confirm.
+    const arrival = new Date(Date.now() + 28_800_000) // 8 hours from now
     const booking = await asTenant(() =>
       svc.create({
         outletId,
@@ -219,9 +237,11 @@ describe('S8 — reservation', () => {
     const noShowed = await asTenant(() => svc.noShow(booking.id))
     expect(noShowed.status).toBe('NO_SHOW')
 
-    // Cannot seat a no-show — the machine rules it out.
+    // Cannot seat a no-show — the machine rules it out. The reservation service
+    // translates IllegalTransitionError to a 409 whose message reads
+    // "cannot move from NO_SHOW to SEATED. NO_SHOW is a terminal state."
     await expect(asTenant(() => svc.seat(booking.id))).rejects.toThrow(
-      /ILLEGAL_TRANSITION|transition/i
+      /cannot move from|terminal/i
     )
   })
 
